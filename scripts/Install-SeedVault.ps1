@@ -213,6 +213,24 @@ if (Test-Path -LiteralPath (Join-Path $VaultPath '_manifest.csv')) {
 Write-Host ''
 Write-Host "  [4/4] Setting it to run automatically..." -ForegroundColor Cyan
 
+# An old monitor must be stopped so the upgrade actually takes effect - but that is done
+# as late as possible, immediately before the replacement starts (see Restart-Monitor
+# below). Killing it up here would mean any later failure leaves you with no monitor at
+# all, which is the one state this tool must never put you in.
+function Restart-Monitor {
+    param([string]$Launcher)
+    $existing = @(Get-MonitorProcess)
+    foreach ($e in $existing) {
+        try   { Stop-Process -Id $e.ProcessId -Force -ErrorAction Stop }
+        catch { Write-Host "  Could not stop old monitor PID $($e.ProcessId)." -ForegroundColor Yellow }
+    }
+    if ($existing.Count -gt 0) {
+        Write-Host "  Replaced the previous monitor." -ForegroundColor Gray
+        Start-Sleep -Seconds 2
+    }
+    Start-Process -FilePath 'wscript.exe' -ArgumentList ('"{0}"' -f $Launcher)
+}
+
 $watcher    = Join-Path $appDir 'Watch-Saves.ps1'
 $psArgs     = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Quiet' -f $watcher
 $autoMethod = $null
@@ -248,19 +266,36 @@ try {
     $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger @($tLogon, $tRepeat) -Settings $settings -Principal $principal -Description 'Caretaker SeedVault - keeps a timestamped copy of every game save.' | Out-Null
-    Start-ScheduledTask -TaskName $script:TaskName
     $autoMethod = 'Scheduled Task'
-    Write-Host "  Registered a scheduled task and started it." -ForegroundColor Green
+    Write-Host "  Registered a scheduled task." -ForegroundColor Green
+    Restart-Monitor $launcher
 } catch {
     # Some machines block task registration. The Startup folder always works.
     Write-Host "  Scheduled task unavailable ($($_.Exception.Message.Split([Environment]::NewLine)[0]))." -ForegroundColor Yellow
     Write-Host "  Falling back to the Startup folder instead." -ForegroundColor Yellow
-    $startup = [Environment]::GetFolderPath('Startup')
-    Copy-Item -LiteralPath $launcher -Destination (Join-Path $startup "$($script:AppSlug).vbs") -Force
-    # Start it the same windowless way, not via Start-Process powershell.
-    Start-Process -FilePath 'wscript.exe' -ArgumentList ('"{0}"' -f $launcher)
-    $autoMethod = 'Startup folder'
-    Write-Host "  Added to Startup and started it." -ForegroundColor Green
+    try {
+        $startup = [Environment]::GetFolderPath('Startup')
+        Copy-Item -LiteralPath $launcher -Destination (Join-Path $startup "$($script:AppSlug).vbs") -Force
+        $autoMethod = 'Startup folder'
+        Write-Host "  Added to your Startup folder." -ForegroundColor Green
+    } catch {
+        $autoMethod = 'NOT set to start automatically'
+        Write-Host "  Could not set it to start automatically." -ForegroundColor Red
+    }
+    Restart-Monitor $launcher
+}
+
+# Whatever happened above, confirm a monitor is actually running. Setup reporting success
+# while nothing is watching would be the worst possible outcome.
+Start-Sleep -Seconds 3
+$live = @(Get-MonitorProcess)
+if ($live.Count -gt 0) {
+    Write-Host "  Monitor is running." -ForegroundColor Green
+} else {
+    Write-Host ''
+    Write-Host "  WARNING: the monitor did not start. Your saves are NOT being copied." -ForegroundColor Red
+    Write-Host "  Try running this to start it by hand:" -ForegroundColor Yellow
+    Write-Host "    wscript.exe `"$launcher`"" -ForegroundColor Yellow
 }
 
 # Shortcuts, so people can find Restore without hunting for a script.

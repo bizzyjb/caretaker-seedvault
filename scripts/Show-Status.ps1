@@ -33,8 +33,7 @@ if ($cfg) {
 # monitor and exits straight away, so a healthy setup shows the task as "Ready" while the
 # monitor runs happily detached - reading the task state alone would be misleading.
 $task = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
-$proc = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-          Where-Object { $_.CommandLine -like '*Watch-Saves.ps1*' })
+$proc = @(Get-MonitorProcess)
 
 $running = ($proc.Count -gt 0)
 if ($task)                   { $how = 'starts at logon, checks itself every 15 min' }

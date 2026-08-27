@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.5
+
+- **Upgrading now actually replaces the running monitor.** Setup started the new monitor
+  without stopping the old one, so after an upgrade you could end up with two monitors on
+  one vault — or, once the vault lock landed in 1.0.3, with the new monitor backing off
+  and the *old* code still running, meaning the fix you just installed never took effect.
+- **Setup can no longer kill the wrong process.** It identified the monitor by looking for
+  the script name anywhere in a process's command line, which could match the very window
+  Setup was launched from. It now matches the exact command the monitor is started with,
+  and never matches itself.
+- **Setup never leaves you unprotected.** The old monitor is stopped as late as possible,
+  immediately before its replacement starts, so a failure part-way through can't leave
+  nothing watching. Setup now also verifies a monitor is running before reporting success,
+  and says so loudly if it isn't.
+
 ## 1.0.4
 
 - **Re-running Setup no longer duplicates your vault.** Setup took a fresh snapshot of

@@ -5,7 +5,7 @@
 
 $script:AppName    = 'Caretaker SeedVault'
 $script:AppSlug    = 'CaretakerSeedVault'
-$script:AppVersion = '1.0.4'
+$script:AppVersion = '1.0.5'
 $script:TaskName   = 'CaretakerSeedVault'
 
 # Culture-invariant formatting. On a machine with a different locale, culture-aware
@@ -202,6 +202,21 @@ function Resolve-ManualSavePath {
 }
 
 # ----------------------------------------------------------------- utility ----
+
+<#
+    Find the running monitor process(es).
+
+    Matching on the bare script name is dangerous: any process whose command line merely
+    mentions it - the shell that launched Setup, a terminal where the path was typed -
+    would match, and Setup would end up killing its own caller. So match the exact
+    '-File "<path>"' form the monitor is really launched with, and never match ourselves.
+#>
+function Get-MonitorProcess {
+    param([string]$WatcherPath = (Join-Path (Get-AppDir) 'Watch-Saves.ps1'))
+    $marker = '-File "' + $WatcherPath + '"'
+    @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+      Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains($marker) })
+}
 
 function Test-IsCloudSyncedPath {
     param([string]$Path)

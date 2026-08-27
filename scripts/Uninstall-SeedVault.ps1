@@ -55,8 +55,7 @@ if (Test-Path -LiteralPath $vbs) {
 }
 
 # Any monitor still running
-$procs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-           Where-Object { $_.CommandLine -like '*Watch-Saves.ps1*' })
+$procs = @(Get-MonitorProcess)
 foreach ($p in $procs) {
     Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
     Write-Host "  Stopped the running monitor (PID $($p.ProcessId))." -ForegroundColor Green
