@@ -29,27 +29,30 @@ if (-not $cfg) {
 
 if ($cfg) {
 
-$running = $false
-$how     = 'not running'
-
+# The live monitor process is the authority, not the task state. The task launches the
+# monitor and exits straight away, so a healthy setup shows the task as "Ready" while the
+# monitor runs happily detached - reading the task state alone would be misleading.
 $task = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
-if ($task) {
-    $running = ($task.State -eq 'Running')
-    $how = "Scheduled Task ($($task.State))"
-}
 $proc = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
           Where-Object { $_.CommandLine -like '*Watch-Saves.ps1*' })
-if ($proc.Count -gt 0) {
-    $running = $true
-    if (-not $task) { $how = 'Startup folder' }
-}
+
+$running = ($proc.Count -gt 0)
+if ($task)                   { $how = 'starts at logon, checks itself every 15 min' }
+elseif (Test-Path (Join-Path ([Environment]::GetFolderPath('Startup')) "$($script:AppSlug).vbs")) {
+                               $how = 'starts from your Startup folder' }
+else                         { $how = 'no automatic start configured' }
 
 if ($running) {
     Write-Host "  MONITOR: running  ($how)" -ForegroundColor Green
 } else {
-    Write-Host "  MONITOR: NOT RUNNING  ($how)" -ForegroundColor Red
+    Write-Host "  MONITOR: NOT RUNNING" -ForegroundColor Red
     Write-Host "  Your saves are not being protected right now." -ForegroundColor Red
-    Write-Host "  Run Setup.cmd again to fix it." -ForegroundColor Yellow
+    if ($task) {
+        Write-Host "  It should restart by itself within 15 minutes." -ForegroundColor Yellow
+        Write-Host "  To start it immediately: Start-ScheduledTask -TaskName $($script:TaskName)" -ForegroundColor Yellow
+    } else {
+        Write-Host "  Run Setup.cmd again to fix it." -ForegroundColor Yellow
+    }
 }
 
 # ---------------------------------------------------------- what's inside ----

@@ -205,18 +205,40 @@ Write-Host ''
 Write-Host "  [4/4] Setting it to run automatically..." -ForegroundColor Cyan
 
 $watcher    = Join-Path $appDir 'Watch-Saves.ps1'
-$psArgs     = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Quiet' -f $watcher
+$psArgs     = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Quiet' -f $watcher
 $autoMethod = $null
+
+# Launch through wscript rather than powershell.exe directly. Task Scheduler starting
+# powershell.exe shows a console window even with -WindowStyle Hidden, and closing that
+# window kills the monitor - protection silently stops. WScript.Shell.Run with window
+# style 0 creates no window at all, so there is nothing to close by accident.
+$launcher = Join-Path $appDir 'run-hidden.vbs'
+# The script path must be quoted for powershell, but a raw double quote would end the
+# VBScript string literal. Build it with Chr(34) so the quoting survives.
+$launcherBody = @"
+' Caretaker SeedVault - starts the save monitor with no console window.
+Option Explicit
+Dim sh, cmd
+Set sh = CreateObject("WScript.Shell")
+cmd = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " & Chr(34) & "$watcher" & Chr(34) & " -Quiet"
+sh.Run cmd, 0, False
+"@
+Set-Content -LiteralPath $launcher -Value $launcherBody -Encoding ASCII
 
 try {
     if (Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false
     }
-    $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $psArgs
-    $trigger   = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+    $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('"{0}"' -f $launcher)
+    # Two triggers. At logon starts it; the 15-minute repeat is a self-heal, so a monitor
+    # that ever dies comes back without waiting for the next logon. Because wscript exits
+    # immediately after spawning the monitor, the task itself cannot restart it - hence
+    # the repeat. A redundant launch costs nothing: it exits at once on the mutex.
+    $tLogon    = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+    $tRepeat   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 15)
+    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
-    Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description 'Caretaker SeedVault - keeps a timestamped copy of every game save.' | Out-Null
+    Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger @($tLogon, $tRepeat) -Settings $settings -Principal $principal -Description 'Caretaker SeedVault - keeps a timestamped copy of every game save.' | Out-Null
     Start-ScheduledTask -TaskName $script:TaskName
     $autoMethod = 'Scheduled Task'
     Write-Host "  Registered a scheduled task and started it." -ForegroundColor Green
@@ -225,14 +247,9 @@ try {
     Write-Host "  Scheduled task unavailable ($($_.Exception.Message.Split([Environment]::NewLine)[0]))." -ForegroundColor Yellow
     Write-Host "  Falling back to the Startup folder instead." -ForegroundColor Yellow
     $startup = [Environment]::GetFolderPath('Startup')
-    $vbs     = Join-Path $startup "$($script:AppSlug).vbs"
-    $vbsBody = @"
-' Caretaker SeedVault - starts the save monitor hidden at logon.
-Set sh = CreateObject("WScript.Shell")
-sh.Run "powershell.exe $psArgs", 0, False
-"@
-    Set-Content -LiteralPath $vbs -Value $vbsBody -Encoding ASCII
-    Start-Process -FilePath 'powershell.exe' -ArgumentList $psArgs -WindowStyle Hidden
+    Copy-Item -LiteralPath $launcher -Destination (Join-Path $startup "$($script:AppSlug).vbs") -Force
+    # Start it the same windowless way, not via Start-Process powershell.
+    Start-Process -FilePath 'wscript.exe' -ArgumentList ('"{0}"' -f $launcher)
     $autoMethod = 'Startup folder'
     Write-Host "  Added to Startup and started it." -ForegroundColor Green
 }

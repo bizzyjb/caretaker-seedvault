@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.0.2
+
+Important fix for anyone running 1.0.0 or 1.0.1 — **please update.**
+
+- **The monitor no longer shows a console window.** Task Scheduler launching
+  `powershell.exe` displayed a console even with `-WindowStyle Hidden`, and closing that
+  window silently killed the monitor — protection stopped with no warning. It now starts
+  through a windowless launcher, so there is no window to close by accident.
+- **Fixed the Startup-folder fallback, which never worked.** The generated launcher script
+  had a quoting bug that made it fail with a "Windows Script Host" error dialog. This
+  affected machines where scheduled tasks are unavailable.
+- **The monitor now restarts itself.** A 15-minute check restarts it if it ever stops, so
+  a crash no longer leaves you unprotected until the next logon. Redundant launches exit
+  immediately, so the check costs effectively nothing.
+- Status now reports whether the monitor is *actually running* rather than reading the
+  scheduled task's state, which is misleading by design under the new launcher.
+- Uninstall is now best-effort: a step that fails no longer aborts it, and anything left
+  behind is reported so you can remove it by hand.
+
 ## 1.0.1
 
 - **Self-test now covers restoring, not just backing up.** Five new checks confirm a

@@ -62,21 +62,42 @@ foreach ($p in $procs) {
     Write-Host "  Stopped the running monitor (PID $($p.ProcessId))." -ForegroundColor Green
 }
 
+# Every step below is best-effort. Stopping the monitor is the part that matters; a
+# leftover shortcut must never abort the uninstall and leave things half-removed.
+$leftovers = @()
+
 # Start Menu shortcuts
 $menu = Join-Path ([Environment]::GetFolderPath('Programs')) $script:AppName
 if (Test-Path -LiteralPath $menu) {
-    Remove-Item -LiteralPath $menu -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host "  Removed the Start Menu shortcuts." -ForegroundColor Green
+    try {
+        Remove-Item -LiteralPath $menu -Recurse -Force -ErrorAction Stop
+        Write-Host "  Removed the Start Menu shortcuts." -ForegroundColor Green
+    } catch {
+        $leftovers += $menu
+        Write-Host "  Could not remove the Start Menu shortcuts." -ForegroundColor Yellow
+    }
 }
 
 # Installed program files and settings. The vault itself is deliberately untouched.
 $root = Get-InstallRoot
 if (Test-Path -LiteralPath $root) {
-    # Can't delete the folder holding the script that is currently executing, so
-    # schedule it for after we exit.
-    $cmd = "ping 127.0.0.1 -n 3 > nul & rmdir /s /q `"$root`""
-    Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', $cmd -WindowStyle Hidden
-    Write-Host "  Removing installed files from $root" -ForegroundColor Green
+    try {
+        # Can't delete the folder holding the script that is currently executing, so
+        # hand it to a detached shell that waits for us to exit first.
+        $cmd = "ping 127.0.0.1 -n 3 > nul & rmdir /s /q `"$root`""
+        Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', $cmd -WindowStyle Hidden -ErrorAction Stop
+        Write-Host "  Removing installed files from $root" -ForegroundColor Green
+    } catch {
+        $leftovers += $root
+        Write-Host "  Could not remove $root" -ForegroundColor Yellow
+    }
+}
+
+if ($leftovers.Count -gt 0) {
+    Write-Host ''
+    Write-Host "  The monitor is stopped and will not start again, but these could not be" -ForegroundColor Yellow
+    Write-Host "  deleted automatically. Delete them by hand if you want them gone:" -ForegroundColor Yellow
+    foreach ($l in $leftovers) { Write-Host "    $l" -ForegroundColor Yellow }
 }
 
 Write-Host ''
