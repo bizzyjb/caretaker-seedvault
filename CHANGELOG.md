@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.4
+
+- **Re-running Setup no longer duplicates your vault.** Setup took a fresh snapshot of
+  every save each time it ran, including when re-run to upgrade — which is the documented
+  upgrade path. On a vault that already had history that was several hundred MB of exact
+  duplicates per upgrade, in a tool that never deletes anything. Setup now snapshots only
+  when the vault is new, and keeps existing history untouched otherwise.
+
 ## 1.0.3
 
 - **Two monitors can no longer write to the same vault.** The internal lock is now keyed

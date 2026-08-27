@@ -183,21 +183,30 @@ Write-SeedVaultConfig $config
 
 # Capture what exists right now, before the game recycles any of it. The game's own
 # backup folder holds states that exist nowhere else and are deleted on a rolling basis.
-$stamp    = (Get-Date).ToString('yyyy-MM-dd_HH-mm-ss', $script:Inv)
-$snapDir  = Join-Path $VaultPath "_snapshot_$stamp"
-$snapped  = 0
-foreach ($sp in @($chosen.SourcePaths)) {
-    if (-not (Test-Path -LiteralPath $sp)) { continue }
-    $leaf = Split-Path (Split-Path $sp -Parent) -Leaf   # SaveGames | SaveGameBackups
-    $dest = Join-Path $snapDir $leaf
-    New-Item -ItemType Directory -Path $dest -Force | Out-Null
-    $files = @(Get-ChildItem -LiteralPath $sp -Filter '*.sav' -File -ErrorAction SilentlyContinue)
-    foreach ($f in $files) {
-        Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $dest $f.Name) -Force
-        $snapped++
+#
+# Only on a genuinely new vault, though. Re-running Setup is the documented way to
+# upgrade, and a vault that already has a manifest has been watched all along - taking
+# another snapshot would just duplicate hundreds of MB that are already stored, every
+# single upgrade, in a tool that deliberately never deletes anything.
+if (Test-Path -LiteralPath (Join-Path $VaultPath '_manifest.csv')) {
+    Write-Host "  Existing vault found - keeping its history, no new snapshot needed." -ForegroundColor Green
+} else {
+    $stamp    = (Get-Date).ToString('yyyy-MM-dd_HH-mm-ss', $script:Inv)
+    $snapDir  = Join-Path $VaultPath "_snapshot_$stamp"
+    $snapped  = 0
+    foreach ($sp in @($chosen.SourcePaths)) {
+        if (-not (Test-Path -LiteralPath $sp)) { continue }
+        $leaf = Split-Path (Split-Path $sp -Parent) -Leaf   # SaveGames | SaveGameBackups
+        $dest = Join-Path $snapDir $leaf
+        New-Item -ItemType Directory -Path $dest -Force | Out-Null
+        $files = @(Get-ChildItem -LiteralPath $sp -Filter '*.sav' -File -ErrorAction SilentlyContinue)
+        foreach ($f in $files) {
+            Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $dest $f.Name) -Force
+            $snapped++
+        }
     }
+    Write-Host "  Snapshot: $snapped save file(s) secured in $(Split-Path $snapDir -Leaf)" -ForegroundColor Green
 }
-Write-Host "  Snapshot: $snapped save file(s) secured in $(Split-Path $snapDir -Leaf)" -ForegroundColor Green
 
 # ------------------------------------------------------ 4. run at logon ----
 
