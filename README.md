@@ -8,6 +8,10 @@ writes, so you can go back to any moment — not just the last few minutes.
 In the game you gather seeds and keep them safe so nothing is lost for good. This does
 the same thing for your progress.
 
+### [⬇ Download the latest version](https://github.com/bizzyjb/caretaker-seedvault/releases/latest)
+
+Unzip it, double-click `Setup.cmd`, done. No admin rights, no accounts, nothing to install.
+
 ---
 
 ## The problem it solves
@@ -28,7 +32,8 @@ somewhere safe, and **nothing in the vault is ever overwritten or deleted**.
 
 ## Quick start
 
-1. Download the latest release and **unzip the whole folder**.
+1. [Download the latest release](https://github.com/bizzyjb/caretaker-seedvault/releases/latest)
+   and **unzip the whole folder**.
 2. Double-click **`Setup.cmd`**.
 3. Answer two questions: which saves to watch, and where to keep the vault.
 
