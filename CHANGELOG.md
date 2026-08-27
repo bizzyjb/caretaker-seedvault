@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.3
+
+- **Two monitors can no longer write to the same vault.** The internal lock is now keyed
+  on the vault folder rather than the app, so a second monitor pointed at a vault already
+  being watched backs off instead of running alongside. Previously two monitors (for
+  example an older install plus a new one, both aimed at the same folder) would race on
+  the same temporary file, and could in principle commit a mixed-content save that still
+  passed its length check. A monitor watching a *different* vault is still free to run at
+  the same time, which previously was not possible.
+
 ## 1.0.2
 
 Important fix for anyone running 1.0.0 or 1.0.1 — **please update.**

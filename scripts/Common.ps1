@@ -5,7 +5,7 @@
 
 $script:AppName    = 'Caretaker SeedVault'
 $script:AppSlug    = 'CaretakerSeedVault'
-$script:AppVersion = '1.0.2'
+$script:AppVersion = '1.0.3'
 $script:TaskName   = 'CaretakerSeedVault'
 
 # Culture-invariant formatting. On a machine with a different locale, culture-aware

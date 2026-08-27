@@ -333,9 +333,21 @@ function Invoke-Prune {
 
 # ------------------------------------------------------------------- main ----
 
-$mutex = New-Object System.Threading.Mutex($false, "Local\$script:AppSlug")
+# The lock is keyed on the VAULT, not on the app name. Two monitors writing to one vault
+# would race on the same temporary file and could commit a mixed-content save that still
+# passed its length check - corruption in the one place that must never have any. Keying
+# on the vault means any second monitor for this vault backs off, whichever install it
+# came from, while a monitor for a different vault is free to run alongside.
+$vaultKey = ([System.BitConverter]::ToString(
+    (New-Object System.Security.Cryptography.SHA256Managed).ComputeHash(
+        [System.Text.Encoding]::UTF8.GetBytes($ArchivePath.ToLowerInvariant().TrimEnd('\'))
+    )) -replace '-', '').Substring(0, 16)
+
+$mutex = New-Object System.Threading.Mutex($false, "Local\$($script:AppSlug)_$vaultKey")
 if (-not $mutex.WaitOne(0)) {
-    Write-Host "Caretaker SeedVault is already running. Nothing to do." -ForegroundColor Yellow
+    Write-Host "Another Caretaker SeedVault monitor is already watching this vault:" -ForegroundColor Yellow
+    Write-Host "  $ArchivePath" -ForegroundColor Yellow
+    Write-Host "Nothing to do - the saves are already being looked after." -ForegroundColor Yellow
     exit 2
 }
 
