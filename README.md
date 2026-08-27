@@ -205,3 +205,14 @@ Windows 10 or 11. Uses the PowerShell that ships with Windows — nothing to ins
 ## License
 
 MIT — see [LICENSE](LICENSE). Use it, change it, pass it on.
+
+## Disclaimer
+
+An unofficial, community-made tool. Not affiliated with, endorsed by, or associated with
+the developers or publishers of *The Last Caretaker*. All trademarks are the property of
+their respective owners.
+
+It only ever *reads* your save files. The one exception is the restore feature, which
+writes a save you explicitly picked back into the game's folder — and it copies your
+current save somewhere safe first. As with anything that touches your saves, it comes with
+no warranty; see the LICENSE.
