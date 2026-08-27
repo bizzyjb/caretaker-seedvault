@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.1
+
+- **Setup now warns about Steam Cloud, and says how to turn it off.** Steam can overwrite a
+  restored save when the game next starts, if it decides its cloud copy is newer — so a
+  restore appears to silently fail. Setup detects that the game uses Steam Cloud and
+  recommends disabling it for that one game, explaining that nothing is lost by doing so.
+- The same reminder appears at restore time, which is the moment it actually matters, and
+  the README has a section on it plus a troubleshooting entry for the symptom
+  ("I restored an old save but the game loaded my newest one").
+- Detection is honest about its limits: Steam leaves its marker file behind after cloud is
+  disabled, so the tool can tell the game *uses* Steam Cloud but not whether it is
+  currently on. The wording reflects that rather than guessing.
+
 ## 1.1.0
 
 - **Restore into any slot you like.** A save goes back to its own slot by default, but you

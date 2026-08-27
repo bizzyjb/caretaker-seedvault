@@ -322,6 +322,12 @@ try {
 
 # ------------------------------------------------------------- summary ----
 
+# Steam Cloud can quietly undo a restore, which is the one thing that would make this
+# whole tool look broken. Say so while the user is still here, not in a README they
+# will read after it has already happened.
+$cloudSaves = Test-SteamCloudSaves -SourcePaths @($chosen.SourcePaths)
+if ($cloudSaves) { Show-SteamCloudAdvice }
+
 Write-Host ''
 Write-Host '  ------------------------------------------------------------' -ForegroundColor DarkCyan
 Write-Host '   All set. Your saves are being preserved.' -ForegroundColor Green
@@ -337,6 +343,10 @@ if ($shortcutsMade) {
 Write-Host ''
 Write-Host "   To get a save back later, open Start Menu > $script:AppName > Restore a Save" -ForegroundColor Cyan
 Write-Host "   (or run Restore.cmd from this folder)." -ForegroundColor Cyan
+if ($cloudSaves) {
+    Write-Host ''
+    Write-Host "   Don't forget the Steam Cloud step above - it matters when restoring." -ForegroundColor Yellow
+}
 Write-Host ''
 Write-Host "   Play normally. You don't need to do anything else." -ForegroundColor Gray
 Write-Host ''

@@ -40,6 +40,9 @@ somewhere safe, and **nothing in the vault is ever overwritten or deleted**.
 That's it. It runs quietly in the background from then on and starts automatically
 whenever you log in. No administrator rights needed.
 
+**One thing worth doing afterwards: [turn off Steam Cloud for this game](#turn-off-steam-cloud-for-this-game).**
+Otherwise Steam can quietly undo your restores. Setup reminds you about this too.
+
 > **Tip:** before unzipping, right-click the `.zip` → **Properties** → tick **Unblock**.
 > Windows flags anything downloaded from the internet, and this saves you some prompts.
 
@@ -60,6 +63,29 @@ half-written save is never stored, and that an existing vault file is never over
 and that restoring puts the right save back, clears the read-only flag so the game can
 still write to it, and keeps the save it replaced. If that passes on your machine, the
 tool works on your machine.
+
+---
+
+## Turn off Steam Cloud for this game
+
+**Do this if you're on Steam.** The game syncs its saves through Steam Cloud, and that
+works directly against restoring: if Steam decides its cloud copy is newer than the save
+you just put back, it can overwrite your restored save when the game next starts. The
+restore then looks like it silently failed, which is a miserable thing to debug.
+
+> Steam → Library → right-click the game → **Properties** → **General** →
+> untick **Keep game saves in the Steam Cloud**
+
+**You lose nothing by doing this.** Your saves stay on your PC, and SeedVault keeps its own
+complete history. The only thing it stops is Steam syncing *this game's* saves between
+computers — every other game is unaffected.
+
+Setup will remind you if it sees that the game uses Steam Cloud. It can't tell whether
+you've already turned it off, though: Steam leaves its marker file in place either way.
+
+**Symptom to watch for:** you restore an old save, launch the game, and you're back at
+your most recent progress instead. That's Steam Cloud, not a failed restore — your save is
+still safe in the vault.
 
 ---
 
@@ -223,6 +249,11 @@ Only if you put it on a different drive from your saves — Setup will suggest o
 have it. It fully protects against the game overwriting saves either way, but a copy on
 the same physical disk dies with that disk. Copying the vault to another drive
 occasionally is worth doing.
+
+**I restored an old save but the game loaded my newest one.**
+That's Steam Cloud overwriting the restored file — see
+[Turn off Steam Cloud for this game](#turn-off-steam-cloud-for-this-game). Nothing is lost;
+your save is still in the vault. Turn cloud off for the game and restore again.
 
 **Something looks wrong.**
 Run `Status.cmd`, check `_log.txt` in your vault, and open an issue with what it says.

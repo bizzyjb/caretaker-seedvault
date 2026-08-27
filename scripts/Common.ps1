@@ -5,7 +5,7 @@
 
 $script:AppName    = 'Caretaker SeedVault'
 $script:AppSlug    = 'CaretakerSeedVault'
-$script:AppVersion = '1.1.0'
+$script:AppVersion = '1.1.1'
 $script:TaskName   = 'CaretakerSeedVault'
 
 # Culture-invariant formatting. On a machine with a different locale, culture-aware
@@ -216,6 +216,53 @@ function Get-MonitorProcess {
     $marker = '-File "' + $WatcherPath + '"'
     @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
       Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains($marker) })
+}
+
+<#
+    Does this game sync its saves through Steam Cloud?
+
+    Steam drops steam_autocloud.vdf beside the saves. Note that the file STAYS after cloud
+    is turned off for the game, so this detects "this game uses Steam Cloud", not "cloud is
+    currently enabled" - the advice is worded to suit.
+#>
+function Test-SteamCloudSaves {
+    param([string[]]$SourcePaths)
+    foreach ($p in @($SourcePaths)) {
+        if ($p -and (Test-Path -LiteralPath (Join-Path $p 'steam_autocloud.vdf'))) { return $true }
+    }
+    return $false
+}
+
+<#
+    Steam Cloud can silently undo a restore, so say so in one place and use it everywhere.
+#>
+function Show-SteamCloudAdvice {
+    param([switch]$Short)
+    if ($Short) {
+        Write-Host "  Reminder: if Steam Cloud is on for this game, it can replace your restored" -ForegroundColor Yellow
+        Write-Host "  save when the game next starts. See the README if a restore seems to undo itself." -ForegroundColor Yellow
+        return
+    }
+    Write-Host ''
+    Write-Host '  ------------------------------------------------------------' -ForegroundColor Yellow
+    Write-Host '   Worth doing: turn off Steam Cloud for this game' -ForegroundColor Yellow
+    Write-Host '  ------------------------------------------------------------' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host "  This game can sync its saves through Steam Cloud. That works against you" -ForegroundColor Gray
+    Write-Host "  when restoring: if Steam decides its cloud copy is newer than the save you" -ForegroundColor Gray
+    Write-Host "  just put back, it can overwrite your restored save when the game starts -" -ForegroundColor Gray
+    Write-Host "  so the restore looks like it silently failed." -ForegroundColor Gray
+    Write-Host ''
+    Write-Host "  To turn it off for this one game:" -ForegroundColor White
+    Write-Host "    Steam  ->  Library  ->  right-click the game  ->  Properties" -ForegroundColor Cyan
+    Write-Host "           ->  General  ->  untick 'Keep game saves in the Steam Cloud'" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host "  You lose nothing by doing this. Your saves stay on this PC and SeedVault" -ForegroundColor Gray
+    Write-Host "  keeps its own full history. It only stops Steam syncing THIS game's saves" -ForegroundColor Gray
+    Write-Host "  between computers - every other game is unaffected." -ForegroundColor Gray
+    Write-Host ''
+    Write-Host "  (Steam leaves its marker file behind either way, so this tool cannot tell" -ForegroundColor DarkGray
+    Write-Host "   whether you have already turned it off.)" -ForegroundColor DarkGray
 }
 
 function Test-IsCloudSyncedPath {

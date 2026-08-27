@@ -199,6 +199,12 @@ if ($targetSlot -like 'AutoSave*') {
     Write-Host "   Note: the game overwrites the autosave slot on its own schedule, so a" -ForegroundColor Yellow
     Write-Host "   save restored there may not survive long. A numbered slot is safer." -ForegroundColor Yellow
 }
+# The moment this actually bites is right here, so mention it here rather than only
+# in a README the user reads after a restore has already reverted on them.
+if (Test-SteamCloudSaves -SourcePaths @($SavePath)) {
+    Write-Host ''
+    Show-SteamCloudAdvice -Short
+}
 Write-Host ''
 if (-not $Yes) {
     $confirm = Read-Host "  Type YES to go ahead"
