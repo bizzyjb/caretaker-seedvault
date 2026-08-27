@@ -55,6 +55,12 @@ never touches your real saves:
 powershell -ExecutionPolicy Bypass -File scripts\Show-Status.ps1 -SelfTest
 ```
 
+It runs 11 checks covering **both halves**: that saves get captured (including that a
+half-written save is never stored, and that an existing vault file is never overwritten),
+and that restoring puts the right save back, clears the read-only flag so the game can
+still write to it, and keeps the save it replaced. If that passes on your machine, the
+tool works on your machine.
+
 ---
 
 ## Getting a save back

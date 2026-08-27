@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.1
+
+- **Self-test now covers restoring, not just backing up.** Five new checks confirm a
+  chosen save is put back correctly, the read-only flag is cleared (a read-only save
+  would stop the game writing that slot), the save being replaced is kept first, and
+  nothing in the vault is destroyed. `Show-Status.ps1 -SelfTest` now runs 11 checks.
+- Added `-Index` and `-Yes` to `Restore-Save.ps1` so a restore can be scripted without
+  prompts. This is what the self-test uses.
+
 ## 1.0.0
 
 First release.

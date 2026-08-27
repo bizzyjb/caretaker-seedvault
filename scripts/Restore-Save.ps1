@@ -10,13 +10,16 @@
 .EXAMPLE
     .\Restore-Save.ps1
     .\Restore-Save.ps1 -Slot AutoSave -Last 60
+    .\Restore-Save.ps1 -Index 2 -Yes      # no prompts; used by the self-test
 #>
 [CmdletBinding()]
 param(
     [string]$Slot,
     [int]   $Last = 30,
     [string]$VaultPath,
-    [string]$SavePath
+    [string]$SavePath,
+    [int]   $Index,      # pick this entry instead of asking
+    [switch]$Yes         # skip the confirmation prompt
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,7 +50,7 @@ Write-Banner 'Restore'
 # Restoring underneath a running game means the game overwrites it moments later.
 $running = @(Get-Process -ErrorAction SilentlyContinue |
              Where-Object { $_.ProcessName -match 'Voyage|Caretaker' })
-if ($running.Count -gt 0) {
+if ($running.Count -gt 0 -and -not $Yes) {
     Write-Host "  The game appears to be running." -ForegroundColor Red
     Write-Host "  Close it first, or it will overwrite whatever you restore." -ForegroundColor Red
     Write-Host ''
@@ -88,12 +91,21 @@ if ($all.Count -gt $shown.Count) {
 }
 
 Write-Host ''
-$pick = Read-Host "  Restore which number? (Enter to cancel)"
-if ([string]::IsNullOrWhiteSpace($pick)) { Write-Host '  Cancelled.'; return }
 $idx = 0
-if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 1 -or $idx -gt $shown.Count) {
-    Write-Host "  '$pick' isn't one of the numbers listed." -ForegroundColor Red
-    return
+if ($Index -gt 0) {
+    $idx = $Index
+    if ($idx -gt $shown.Count) {
+        Write-Host "  There is no entry number $idx (only $($shown.Count) listed)." -ForegroundColor Red
+        return
+    }
+    Write-Host "  Restoring entry $idx (chosen with -Index)." -ForegroundColor Cyan
+} else {
+    $pick = Read-Host "  Restore which number? (Enter to cancel)"
+    if ([string]::IsNullOrWhiteSpace($pick)) { Write-Host '  Cancelled.'; return }
+    if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 1 -or $idx -gt $shown.Count) {
+        Write-Host "  '$pick' isn't one of the numbers listed." -ForegroundColor Red
+        return
+    }
 }
 
 $chosen   = $shown[$idx - 1]
@@ -110,8 +122,10 @@ if (Test-Path -LiteralPath $target) {
     Write-Host "               (this will be kept in the vault, not lost)" -ForegroundColor DarkGray
 }
 Write-Host ''
-$confirm = Read-Host "  Type YES to go ahead"
-if ($confirm -ne 'YES') { Write-Host '  Cancelled. Nothing was changed.'; return }
+if (-not $Yes) {
+    $confirm = Read-Host "  Type YES to go ahead"
+    if ($confirm -ne 'YES') { Write-Host '  Cancelled. Nothing was changed.'; return }
+}
 
 # Never destroy the present to recover the past.
 if (Test-Path -LiteralPath $target) {

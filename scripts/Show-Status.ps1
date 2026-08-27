@@ -141,6 +141,28 @@ if ($SelfTest) {
         $stored3 = @(Get-ChildItem $dst -Recurse -Filter *.sav -File)
         Check 'identical content is not stored twice' ($stored3.Count -eq 2)
 
+        # ---- getting a save back ----
+        # Restoring matters as much as keeping, so prove that half works too.
+        $restorer   = Join-Path $PSScriptRoot 'Restore-Save.ps1'
+        $older      = @(Get-ChildItem $dst -Recurse -Filter *.sav -File | Sort-Object LastWriteTime -Descending)[1]
+        $olderHash  = (Get-FileHash $older.FullName -Algorithm SHA256).Hash
+        $liveBefore = (Get-FileHash $fake -Algorithm SHA256).Hash
+
+        # 6>$null suppresses Write-Host output, which Out-Null does not catch.
+        & $restorer -VaultPath $dst -SavePath $src -Index 2 -Yes 6>$null | Out-Null
+
+        Check 'a chosen save is put back into the game folder' ((Get-FileHash $fake -Algorithm SHA256).Hash -eq $olderHash)
+        Check 'the restored save is not left read-only' (-not (Get-Item $fake).IsReadOnly)
+
+        # A read-only restored save would stop the game writing that slot at all.
+        $canWrite = $false
+        try { $h = [System.IO.File]::Open($fake, 'Open', 'Write', 'None'); $h.Close(); $canWrite = $true } catch { }
+        Check 'the game can still write to the restored save' $canWrite
+
+        $kept = @(Get-ChildItem (Join-Path $dst '_before-restore') -Recurse -File -ErrorAction SilentlyContinue)
+        Check 'the save being replaced was kept first' ($kept.Count -ge 1 -and (Get-FileHash $kept[0].FullName -Algorithm SHA256).Hash -eq $liveBefore)
+        Check 'restoring destroyed nothing in the vault' ((Test-Path $older.FullName) -and (Get-FileHash $older.FullName -Algorithm SHA256).Hash -eq $olderHash)
+
         Write-Host ''
         if ($fail -eq 0) {
             Write-Host "   $pass checks passed. The vault is working correctly." -ForegroundColor Green
