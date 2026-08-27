@@ -84,6 +84,26 @@ Your current save is copied into the vault *before* anything is replaced, so res
 old save never costs you the one you have now. If you restore the wrong one, just restore
 again.
 
+### Restoring into a different slot
+
+By default a save goes back where it came from. You can also send it somewhere else —
+handy for comparing two points in time, or for parking an old save in a spare slot instead
+of overwriting the one you're playing.
+
+After you pick a save, it shows which slots are in use and offers to put it elsewhere.
+Press Enter to keep the original slot, or type a slot number (or `auto` for the autosave
+slot). From the command line:
+
+```powershell
+.\Restore-Save.ps1 -Index 3 -ToSlot 2
+```
+
+**One caveat worth knowing.** A save records inside itself which slot it belongs to, and
+restoring elsewhere does not rewrite that. The game loads it from the new slot fine, but
+if it uses that internal value when saving, your next save may land back in the *original*
+slot. After loading a save you've moved, save once and check which slot actually changed.
+Nothing can be lost either way — every version is in the vault.
+
 ---
 
 ## What ends up in the vault

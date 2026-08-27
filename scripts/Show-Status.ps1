@@ -145,12 +145,23 @@ if ($SelfTest) {
 
         # ---- getting a save back ----
         # Restoring matters as much as keeping, so prove that half works too.
+        #
+        # Order matters here. A same-slot restore drops a copy into _before-restore, which
+        # then appears in the listing too and shifts what "-Index 2" refers to. So do the
+        # different-slot restore first, while the vault still holds exactly two entries.
         $restorer   = Join-Path $PSScriptRoot 'Restore-Save.ps1'
         $older      = @(Get-ChildItem $dst -Recurse -Filter *.sav -File | Sort-Object LastWriteTime -Descending)[1]
         $olderHash  = (Get-FileHash $older.FullName -Algorithm SHA256).Hash
         $liveBefore = (Get-FileHash $fake -Algorithm SHA256).Hash
 
+        # ---- restoring into a different slot (nothing exists in slot 3 yet) ----
         # 6>$null suppresses Write-Host output, which Out-Null does not catch.
+        & $restorer -VaultPath $dst -SavePath $src -Index 2 -ToSlot 3 -Yes 6>$null | Out-Null
+        $slot3 = Join-Path $src 'TestProfile_3.sav'
+        Check 'a save can be restored into a different slot' ((Test-Path $slot3) -and (Get-FileHash $slot3 -Algorithm SHA256).Hash -eq $olderHash)
+        Check 'restoring elsewhere leaves the original slot alone' ((Get-FileHash $fake -Algorithm SHA256).Hash -eq $liveBefore)
+
+        # ---- restoring into its own slot ----
         & $restorer -VaultPath $dst -SavePath $src -Index 2 -Yes 6>$null | Out-Null
 
         Check 'a chosen save is put back into the game folder' ((Get-FileHash $fake -Algorithm SHA256).Hash -eq $olderHash)

@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.0
+
+- **Restore into any slot you like.** A save goes back to its own slot by default, but you
+  can now send it elsewhere — useful for comparing two points in time, or parking an old
+  save in a spare slot instead of overwriting the one you are playing. The restore screen
+  shows which slots are in use and offers a different target; `-ToSlot` does the same from
+  the command line. `auto` targets the autosave slot.
+- Note: a save records internally which slot it belongs to, and moving it does not rewrite
+  that. The game loads it from the new slot, but if it uses that internal value when
+  saving, the next save may land back in the original slot. The restore screen warns about
+  this and tells you what to check. Nothing can be lost either way.
+- Self-test extended to cover restoring into a different slot (13 checks).
+
 ## 1.0.5
 
 - **Upgrading now actually replaces the running monitor.** Setup started the new monitor

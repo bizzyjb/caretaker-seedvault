@@ -19,6 +19,7 @@ param(
     [string]$VaultPath,
     [string]$SavePath,
     [int]   $Index,      # pick this entry instead of asking
+    [string]$ToSlot,     # put it in a different slot: 0, 1, 2, 3 ... or 'auto'
     [switch]$Yes         # skip the confirmation prompt
 )
 
@@ -43,6 +44,44 @@ function Get-SlotName {
     # The game's own naming: <slot>_2026-08-27_08_16_21[_2].sav
     if ($FileName -match '^(.*?)_\d{4}-\d{2}-\d{2}_\d{2}_\d{2}_\d{2}(_\d+)?\.[^.]+$')  { return $Matches[1] }
     return [System.IO.Path]::GetFileNameWithoutExtension($FileName)
+}
+
+<#
+    Split "76561197961167679_AutoSave_0" into its profile id and its slot designator.
+    Autosave has to be checked first, or the trailing digit of "AutoSave_0" would be
+    mistaken for the slot number.
+#>
+function Split-SlotName {
+    param([string]$SlotName)
+    if ($SlotName -match '^(.*)_(AutoSave_\d+)$') { return @{ Profile = $Matches[1]; Designator = $Matches[2] } }
+    if ($SlotName -match '^(.*)_(\d+)$')          { return @{ Profile = $Matches[1]; Designator = $Matches[2] } }
+    return @{ Profile = $SlotName; Designator = '' }
+}
+
+# Accept "2", "slot 2", "auto", "autosave" and so on.
+function Resolve-SlotDesignator {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $t = $Text.Trim()
+    if ($t -match '^(?i)a(uto)?(save)?(_?\d+)?$') {
+        if ($t -match '(\d+)$') { return "AutoSave_$($Matches[1])" }
+        return 'AutoSave_0'
+    }
+    if ($t -match '(\d+)\s*$') { return $Matches[1] }
+    return $null
+}
+
+# Show what is in each slot right now, so picking a target is an informed choice.
+function Show-CurrentSlots {
+    param([string]$SavePath, [string]$Profile)
+    $live = @(Get-ChildItem -LiteralPath $SavePath -Filter '*.sav' -File -ErrorAction SilentlyContinue)
+    Write-Host ''
+    Write-Host "  Slots in use right now:" -ForegroundColor Cyan
+    if ($live.Count -eq 0) { Write-Host "    (none)" -ForegroundColor DarkGray; return }
+    foreach ($l in ($live | Sort-Object Name)) {
+        $d = (Split-SlotName ([System.IO.Path]::GetFileNameWithoutExtension($l.Name))).Designator
+        Write-Host ("    slot {0,-12} {1,9}   last saved {2}" -f $d, (Format-Size $l.Length), $l.LastWriteTime)
+    }
 }
 
 Write-Banner 'Restore'
@@ -110,16 +149,55 @@ if ($Index -gt 0) {
 
 $chosen   = $shown[$idx - 1]
 $slotName = Get-SlotName $chosen.Name
-$target   = Join-Path $SavePath ($slotName + $chosen.Extension)
+$parts    = Split-SlotName $slotName
+$fromSlot = $parts.Designator
+
+# ---- which slot should it go into? ----
+
+$targetSlot = $fromSlot
+if ($PSBoundParameters.ContainsKey('ToSlot') -and $ToSlot) {
+    $targetSlot = Resolve-SlotDesignator $ToSlot
+    if (-not $targetSlot) { Write-Host "  '$ToSlot' is not a slot I understand." -ForegroundColor Red; return }
+} elseif (-not $Yes) {
+    Write-Host ''
+    Write-Host "  This save came from slot '$fromSlot'." -ForegroundColor Cyan
+    Show-CurrentSlots -SavePath $SavePath -Profile $parts.Profile
+    Write-Host ''
+    Write-Host "  Press Enter to put it back in slot '$fromSlot', or type another slot" -ForegroundColor Gray
+    Write-Host "  (a number like 0, 1, 2, 3 - or 'auto' for the autosave slot)." -ForegroundColor Gray
+    $answer = Read-Host "  Slot"
+    if (-not [string]::IsNullOrWhiteSpace($answer)) {
+        $resolved = Resolve-SlotDesignator $answer
+        if (-not $resolved) { Write-Host "  '$answer' is not a slot I understand. Nothing was changed." -ForegroundColor Red; return }
+        $targetSlot = $resolved
+    }
+}
+
+$target = Join-Path $SavePath ("$($parts.Profile)_$targetSlot" + $chosen.Extension)
 
 Write-Host ''
 Write-Host "   Restoring : $($chosen.Name)" -ForegroundColor Green
 Write-Host "   From      : $($chosen.LastWriteTime)" -ForegroundColor Green
-Write-Host "   Onto      : $target" -ForegroundColor Yellow
+Write-Host "   Into slot : $targetSlot$(if ($targetSlot -ne $fromSlot) { "   (originally slot $fromSlot)" })" -ForegroundColor Yellow
+Write-Host "   File      : $target" -ForegroundColor DarkGray
 if (Test-Path -LiteralPath $target) {
     $cur = Get-Item -LiteralPath $target
     Write-Host "   Replacing : $(Format-Size $cur.Length) from $($cur.LastWriteTime)" -ForegroundColor Yellow
     Write-Host "               (this will be kept in the vault, not lost)" -ForegroundColor DarkGray
+}
+
+if ($targetSlot -ne $fromSlot) {
+    Write-Host ''
+    Write-Host "   Heads up: a save records inside itself which slot it belongs to, and" -ForegroundColor Yellow
+    Write-Host "   that stays saying '$fromSlot'. The game will load it from slot $targetSlot fine," -ForegroundColor Yellow
+    Write-Host "   but if it uses that internal value when saving, your next save could" -ForegroundColor Yellow
+    Write-Host "   land back in slot $fromSlot. After loading, save once and check which slot" -ForegroundColor Yellow
+    Write-Host "   actually changed. Nothing can be lost either way - it is all in the vault." -ForegroundColor Yellow
+}
+if ($targetSlot -like 'AutoSave*') {
+    Write-Host ''
+    Write-Host "   Note: the game overwrites the autosave slot on its own schedule, so a" -ForegroundColor Yellow
+    Write-Host "   save restored there may not survive long. A numbered slot is safer." -ForegroundColor Yellow
 }
 Write-Host ''
 if (-not $Yes) {
@@ -147,5 +225,8 @@ if ($restored.IsReadOnly) { $restored.IsReadOnly = $false }
 $restored.LastWriteTime = $chosen.LastWriteTime
 
 Write-Host ''
-Write-Host "  Done. Start the game and load '$slotName'." -ForegroundColor Green
+Write-Host "  Done. Start the game and load slot $targetSlot." -ForegroundColor Green
+if ($targetSlot -ne $fromSlot) {
+    Write-Host "  Remember to check which slot your next in-game save writes to." -ForegroundColor Yellow
+}
 Write-Host ''
