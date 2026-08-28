@@ -2,8 +2,10 @@
 
 **Every save preserved. Nothing overwritten.**
 
-A tiny Windows tool that keeps a timestamped copy of every save *The Last Caretaker*
-writes, so you can go back to any moment — not just the last few minutes.
+A tiny tool that keeps a timestamped copy of every save *The Last Caretaker* writes, so
+you can go back to any moment — not just the last few minutes.
+
+Available for **Windows** and for **Linux** — including Bazzite and the Steam Deck.
 
 In the game you gather seeds and keep them safe so nothing is lost for good. This does
 the same thing for your progress.
@@ -45,6 +47,24 @@ Otherwise Steam can quietly undo your restores. Setup reminds you about this too
 
 > **Tip:** before unzipping, right-click the `.zip` → **Properties** → tick **Unblock**.
 > Windows flags anything downloaded from the internet, and this saves you some prompts.
+
+### On Linux
+
+Grab `caretaker-seedvault` (or the `-linux-` tarball) from the same release:
+
+```bash
+chmod +x caretaker-seedvault
+./caretaker-seedvault setup
+```
+
+One self-contained Bash script — no Python, no packages, no root. It finds your saves
+inside the Proton prefix, installs as a systemd user service so it runs in Steam Deck
+**Game Mode** too, and keeps everything under `$HOME` so an immutable root filesystem
+(Bazzite, SteamOS) doesn't get in the way.
+
+**See [`linux/README.md`](linux/README.md) for the full Linux guide.** The rest of this
+page describes the Windows edition; the vault format, the restore flow and the Steam
+Cloud advice are identical on both.
 
 ### Checking it's working
 
@@ -278,7 +298,12 @@ Run `Status.cmd`, check `_log.txt` in your vault, and open an issue with what it
 
 ## Requirements
 
-Windows 10 or 11. Uses the PowerShell that ships with Windows — nothing to install.
+**Windows:** Windows 10 or 11. Uses the PowerShell that ships with Windows — nothing to
+install.
+
+**Linux:** any distribution with `bash` 4+ and coreutils. `systemd` is used for autostart
+where it exists, with a desktop-autostart fallback where it doesn't. See
+[`linux/README.md`](linux/README.md).
 
 ## License
 

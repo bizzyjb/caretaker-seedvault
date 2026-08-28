@@ -1,0 +1,2247 @@
+#!/usr/bin/env bash
+#
+# Caretaker SeedVault - Linux edition
+#
+#   Every save preserved. Nothing overwritten.
+#
+# Keeps a timestamped copy of every save The Last Caretaker writes, so you can go back
+# to any moment - not just the last few minutes the game itself keeps.
+#
+# One self-contained script. Needs bash 4+ and coreutils; nothing else.
+# MIT licensed - see LICENSE.
+
+# Deliberately NOT 'set -e'. This program's whole job is to keep running so saves keep
+# being copied; a stray non-zero exit status from a probe must never take the monitor
+# down and leave a session unprotected. Errors are checked where they matter.
+set -uo pipefail
+shopt -s nullglob
+
+APP_NAME='Caretaker SeedVault'
+APP_SLUG='caretaker-seedvault'
+APP_VERSION='1.2.0'
+SERVICE_NAME="${APP_SLUG}.service"
+
+# Culture-invariant everything: a machine with a different locale can otherwise rewrite
+# date separators and produce unsortable or invalid filenames.
+export LC_ALL=C
+
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    echo "Caretaker SeedVault needs bash 4 or newer (found ${BASH_VERSION:-unknown})." >&2
+    exit 1
+fi
+
+# ------------------------------------------------------------------ paths ----
+
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+
+INSTALL_ROOT="$XDG_DATA_HOME/$APP_SLUG"
+INSTALLED_BIN="$INSTALL_ROOT/$APP_SLUG"
+CONFIG_DIR="$XDG_CONFIG_HOME/$APP_SLUG"
+CONFIG_PATH="$CONFIG_DIR/config"
+SYSTEMD_USER_DIR="$XDG_CONFIG_HOME/systemd/user"
+SERVICE_PATH="$SYSTEMD_USER_DIR/$SERVICE_NAME"
+AUTOSTART_PATH="$XDG_CONFIG_HOME/autostart/$APP_SLUG.desktop"
+DESKTOP_DIR="$XDG_DATA_HOME/applications"
+
+# ----------------------------------------------------------------- colour ----
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
+    C_RED=$'\033[31m';  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+    C_CYAN=$'\033[36m'; C_GREY=$'\033[90m'
+else
+    C_RESET=''; C_BOLD=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''; C_GREY=''
+fi
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s%s%s\n' "$C_CYAN"   "$*" "$C_RESET"; }
+good() { printf '%s%s%s\n' "$C_GREEN"  "$*" "$C_RESET"; }
+warn() { printf '%s%s%s\n' "$C_YELLOW" "$*" "$C_RESET"; }
+bad()  { printf '%s%s%s\n' "$C_RED"    "$*" "$C_RESET"; }
+dim()  { printf '%s%s%s\n' "$C_GREY"   "$*" "$C_RESET"; }
+
+die() { bad "  $*" >&2; exit 1; }
+
+banner() {
+    printf '\n'
+    printf '%s  ############################################################%s\n' "$C_CYAN" "$C_RESET"
+    printf '%s  #                                                          #%s\n' "$C_CYAN" "$C_RESET"
+    printf '%s  #%s             C A R E T A K E R   S E E D V A U L T        %s#%s\n' "$C_CYAN" "$C_BOLD" "$C_CYAN" "$C_RESET"
+    printf '%s  #                                                          #%s\n' "$C_CYAN" "$C_RESET"
+    printf '%s  #        Every save preserved. Nothing overwritten.        #%s\n' "$C_CYAN" "$C_RESET"
+    printf '%s  #                                                          #%s\n' "$C_CYAN" "$C_RESET"
+    printf '%s  ############################################################%s\n' "$C_CYAN" "$C_RESET"
+    [ -n "${1:-}" ] && dim "  $1"
+    dim "  v$APP_VERSION - Linux edition"
+    printf '\n'
+}
+
+# ---------------------------------------------------- portability helpers ----
+#
+# GNU coreutils on Linux is the target, but the BSD spellings cost ten lines and mean
+# the tool also works if someone runs it on a Mac.
+
+if stat -c '%Y' . >/dev/null 2>&1; then
+    stat_mtime() { stat -c '%Y' -- "$1" 2>/dev/null; }
+    stat_size()  { stat -c '%s' -- "$1" 2>/dev/null; }
+    stat_mode()  { stat -c '%a' -- "$1" 2>/dev/null; }
+else
+    stat_mtime() { stat -f '%m' -- "$1" 2>/dev/null; }
+    stat_size()  { stat -f '%z' -- "$1" 2>/dev/null; }
+    stat_mode()  { stat -f '%Lp' -- "$1" 2>/dev/null; }
+fi
+
+if date -d '@0' '+%Y' >/dev/null 2>&1; then
+    epoch_fmt() { date -d "@$1" "+$2"; }
+else
+    epoch_fmt() { date -r "$1" "+$2"; }
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256_of() { sha256sum -b -- "$1" 2>/dev/null | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+    sha256_of() { shasum -a 256 -b -- "$1" 2>/dev/null | cut -d' ' -f1; }
+else
+    die "Need sha256sum (coreutils) or shasum. Neither is installed."
+fi
+
+now_stamp()     { date '+%Y-%m-%d %H:%M:%S'; }
+now_iso_utc()   { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+now_iso_local() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+
+fmt_size() {
+    local b=${1:-0}
+    if   [ "$b" -ge 1073741824 ] 2>/dev/null; then awk -v b="$b" 'BEGIN{printf "%.2f GB", b/1073741824}'
+    elif [ "$b" -ge 1048576 ]    2>/dev/null; then awk -v b="$b" 'BEGIN{printf "%.1f MB", b/1048576}'
+    elif [ "$b" -ge 1024 ]       2>/dev/null; then awk -v b="$b" 'BEGIN{printf "%.0f KB", b/1024}'
+    else printf '%s B' "$b"
+    fi
+}
+
+fmt_mtime() {
+    local m; m=$(stat_mtime "$1") || return 1
+    [ -n "$m" ] || return 1
+    epoch_fmt "$m" '%Y-%m-%d %H:%M:%S'
+}
+
+# Free bytes on the filesystem holding a path (or its nearest existing ancestor, so it
+# can be asked about a vault folder that has not been created yet).
+drive_free_bytes() {
+    local p=$1
+    while [ -n "$p" ] && [ ! -d "$p" ]; do
+        local parent; parent=$(dirname -- "$p")
+        [ "$parent" = "$p" ] && break
+        p=$parent
+    done
+    [ -d "$p" ] || return 1
+    df -Pk -- "$p" 2>/dev/null | awk 'NR==2 {print $4 * 1024}'
+}
+
+# The device a path lives on, used to tell "vault is on the same disk as the saves".
+path_device() {
+    local p=$1
+    while [ -n "$p" ] && [ ! -d "$p" ]; do
+        local parent; parent=$(dirname -- "$p")
+        [ "$parent" = "$p" ] && break
+        p=$parent
+    done
+    [ -d "$p" ] || return 1
+    df -P -- "$p" 2>/dev/null | awk 'NR==2 {print $1}'
+}
+
+is_cloud_synced_path() {
+    # 20MB saves landing in a synced folder every few minutes is a bad time.
+    case "$1" in
+        *[Oo]ne[Dd]rive*)    echo OneDrive ;;
+        *[Dd]ropbox*)        echo Dropbox ;;
+        *"Google Drive"*|*[Gg]oogle-[Dd]rive*|*[Gg]drive*) echo "Google Drive" ;;
+        *[Nn]extcloud*)      echo Nextcloud ;;
+        *[Oo]wncloud*)       echo ownCloud ;;
+        *[Ss]yncthing*)      echo Syncthing ;;
+        *[Mm]ega*[Ss]ync*)   echo MEGAsync ;;
+        *[Ii][Cc]loud*)      echo iCloud ;;
+        *)                   return 1 ;;
+    esac
+}
+
+# Trim, strip surrounding quotes, and expand a leading ~ - all things people do when
+# they paste a path into a prompt.
+clean_path() {
+    local p=$1
+    p="${p#"${p%%[![:space:]]*}"}"
+    p="${p%"${p##*[![:space:]]}"}"
+    p="${p%\"}"; p="${p#\"}"
+    p="${p%\'}"; p="${p#\'}"
+    # The tilde here is a literal character being matched, not an expansion.
+    # shellcheck disable=SC2088
+    case "$p" in
+        '~')   p="$HOME" ;;
+        '~/'*) p="$HOME/${p#\~/}" ;;
+    esac
+    printf '%s' "$p"
+}
+
+# ----------------------------------------------------------------- config ----
+#
+# Plain KEY=VALUE, one per line, SourcePath repeated once per watched folder. Not JSON,
+# and not shell-sourced: parsing a handful of known keys by hand means no jq dependency,
+# and no way for a stray line in a config file to execute anything.
+
+CFG_SOURCE_PATHS=()
+CFG_ARCHIVE_PATH=''
+CFG_POLL_SECONDS=4
+CFG_FILE_PATTERN='*.sav'
+CFG_DEDUPE=true
+CFG_READONLY=true
+CFG_MIN_FREE_GB=10
+CFG_PRUNE_AFTER_DAYS=0
+CFG_INSTALLED_AT=''
+CFG_LOADED=false
+
+read_config() {
+    CFG_SOURCE_PATHS=()
+    [ -f "$CONFIG_PATH" ] || return 1
+    local line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        key=${line%%=*}
+        value=${line#*=}
+        [ "$key" = "$line" ] && continue
+        case "$key" in
+            SourcePath)     [ -n "$value" ] && CFG_SOURCE_PATHS+=("$value") ;;
+            ArchivePath)    CFG_ARCHIVE_PATH=$value ;;
+            PollSeconds)    [[ $value =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ] && CFG_POLL_SECONDS=$value ;;
+            FilePattern)    [ -n "$value" ] && CFG_FILE_PATTERN=$value ;;
+            Dedupe)         CFG_DEDUPE=$value ;;
+            ReadOnly)       CFG_READONLY=$value ;;
+            MinFreeGB)      [[ $value =~ ^[0-9]+$ ]] && CFG_MIN_FREE_GB=$value ;;
+            PruneAfterDays) [[ $value =~ ^[0-9]+$ ]] && CFG_PRUNE_AFTER_DAYS=$value ;;
+            InstalledAt)    CFG_INSTALLED_AT=$value ;;
+        esac
+    done < "$CONFIG_PATH"
+    [ -n "$CFG_ARCHIVE_PATH" ] || return 1
+    CFG_LOADED=true
+    return 0
+}
+
+write_config() {
+    mkdir -p -- "$CONFIG_DIR" || die "Could not create $CONFIG_DIR"
+    local tmp="$CONFIG_PATH.tmp.$$"
+    {
+        echo "# $APP_NAME configuration"
+        echo "# Edit this file, then restart the monitor to pick up the changes:"
+        echo "#     $APP_SLUG restart"
+        echo "Version=1"
+        local s
+        for s in ${CFG_SOURCE_PATHS[@]+"${CFG_SOURCE_PATHS[@]}"}; do echo "SourcePath=$s"; done
+        echo "ArchivePath=$CFG_ARCHIVE_PATH"
+        echo "PollSeconds=$CFG_POLL_SECONDS"
+        echo "FilePattern=$CFG_FILE_PATTERN"
+        echo "Dedupe=$CFG_DEDUPE"
+        echo "ReadOnly=$CFG_READONLY"
+        echo "MinFreeGB=$CFG_MIN_FREE_GB"
+        echo "PruneAfterDays=$CFG_PRUNE_AFTER_DAYS"
+        echo "InstalledAt=${CFG_INSTALLED_AT:-$(now_iso_local)}"
+    } > "$tmp" && mv -f -- "$tmp" "$CONFIG_PATH" || die "Could not write $CONFIG_PATH"
+}
+
+is_true() { case "${1,,}" in true|yes|1|on) return 0 ;; *) return 1 ;; esac; }
+
+# -------------------------------------------------------------- detection ----
+#
+# The Last Caretaker is a Windows game; on Linux it runs under Proton or Wine, so its
+# saves sit inside a Windows-shaped tree buried in a compatibility prefix:
+#
+#   <steam>/steamapps/compatdata/1783560/pfx/drive_c/users/steamuser/
+#       AppData/Local/Voyage/Saved/SaveGames/<SteamID>/*.sav
+#
+# where <steam> is typically ~/.local/share/Steam (Bazzite, SteamOS, most distros) or
+# ~/.var/app/com.valvesoftware.Steam/.local/share/Steam (Flatpak Steam).
+#
+# "Voyage" is the game's internal project codename, not a different game. The sibling
+# SaveGameBackups folder is the game's own backup ring - it keeps only a few copies per
+# slot and deletes the rest, which is exactly the gap this tool closes.
+#
+# The AppID below is only used for the "where to look" message. Detection itself matches
+# on the Voyage path, so it keeps working if the AppID ever changes, and it picks up
+# non-Steam installs (Lutris, Heroic, Bottles, plain Wine) for free.
+
+STEAM_APPID=1783560
+# Shown to the user, so the tilde stays a tilde rather than their expanded home path.
+# shellcheck disable=SC2088
+EXAMPLE_SAVE_PATH="~/.local/share/Steam/steamapps/compatdata/$STEAM_APPID/pfx/drive_c/users/steamuser/AppData/Local/Voyage/Saved/SaveGames/<your-steam-id>"
+
+steam_roots() {
+    local candidates=(
+        "$HOME/.local/share/Steam"                                    # most distros, incl. Bazzite
+        "$HOME/.steam/steam"
+        "$HOME/.steam/root"
+        "$HOME/.steam/debian-installation"                            # Debian/Ubuntu steam package
+        "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"   # Flatpak Steam
+        "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"           # Flatpak, older layout
+        "$HOME/snap/steam/common/.local/share/Steam"                  # Snap Steam
+    )
+    local r real
+    for r in "${candidates[@]}"; do
+        [ -d "$r/steamapps" ] || continue
+        real=$(readlink -f -- "$r" 2>/dev/null) || real=$r
+        printf '%s\n' "$real"
+    done | awk 'NF && !seen[$0]++'
+}
+
+# Extra library folders (a second SSD, a Steam Deck SD card) are listed in
+# libraryfolders.vdf as:   "path"   "/run/media/mmcblk0p1"
+# Pull the second quoted field off those lines.
+steam_libraries() {
+    local root vdf
+    for root in $(steam_roots); do
+        printf '%s\n' "$root"
+        for vdf in "$root/steamapps/libraryfolders.vdf" "$root/config/libraryfolders.vdf"; do
+            [ -f "$vdf" ] || continue
+            sed -n 's/^[[:space:]]*"path"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$vdf" 2>/dev/null
+        done
+    done | awk 'NF && !seen[$0]++'
+}
+
+# Every place a ".../Voyage/Saved" folder could plausibly be.
+voyage_saved_dirs() {
+    local -a globs=()
+    local lib
+    while IFS= read -r lib; do
+        [ -n "$lib" ] || continue
+        globs+=("$lib/steamapps/compatdata"/*/pfx/drive_c/users/*/AppData/Local/Voyage/Saved)
+    done < <(steam_libraries)
+
+    # Wine, Lutris, Heroic, Bottles, and anything WINEPREFIX points at.
+    globs+=(
+        "$HOME/.wine"/drive_c/users/*/AppData/Local/Voyage/Saved
+        "$HOME/Games"/*/drive_c/users/*/AppData/Local/Voyage/Saved
+        "$HOME/Games"/*/*/drive_c/users/*/AppData/Local/Voyage/Saved
+        "$HOME/.local/share/wineprefixes"/*/drive_c/users/*/AppData/Local/Voyage/Saved
+        "$HOME/.local/share/bottles/bottles"/*/drive_c/users/*/AppData/Local/Voyage/Saved
+        "$HOME/.var/app"/*/data/*/drive_c/users/*/AppData/Local/Voyage/Saved
+        "$HOME/.var/app"/*/data/*/*/drive_c/users/*/AppData/Local/Voyage/Saved
+    )
+    [ -n "${WINEPREFIX:-}" ] && globs+=("$WINEPREFIX"/drive_c/users/*/AppData/Local/Voyage/Saved)
+
+    # If a native build ever appears, or someone copied the tree out of a prefix.
+    globs+=(
+        "$HOME/.local/share/Voyage/Saved"
+        "$HOME/Documents/My Games/Voyage/Saved"
+    )
+
+    local g
+    for g in "${globs[@]}"; do
+        [ -d "$g/SaveGames" ] && printf '%s\n' "$g"
+    done | awk 'NF && !seen[$0]++'
+}
+
+# Last resort: actually go looking. Bounded in depth and quiet about permission errors,
+# because an unbounded walk of a home directory is slow enough to feel broken.
+voyage_saved_dirs_deep() {
+    find "$HOME" -maxdepth 12 -type d -name SaveGames -path '*/Voyage/Saved/*' -prune -print 2>/dev/null |
+        sed 's#/SaveGames$##' | awk 'NF && !seen[$0]++'
+}
+
+# Emit one TAB-separated record per profile found, newest first:
+#   profile <TAB> savepath <TAB> backuppath <TAB> count <TAB> bytes <TAB> newest_mtime
+find_caretaker_saves() {
+    local deep=${1:-false}
+    local -a saved_dirs=()
+    local d
+    while IFS= read -r d; do [ -n "$d" ] && saved_dirs+=("$d"); done < <(voyage_saved_dirs)
+    if [ ${#saved_dirs[@]} -eq 0 ] && [ "$deep" = true ]; then
+        while IFS= read -r d; do [ -n "$d" ] && saved_dirs+=("$d"); done < <(voyage_saved_dirs_deep)
+    fi
+
+    local saved profile_dir profile bak f count bytes newest sz mt
+    local -a records=()
+    for saved in ${saved_dirs[@]+"${saved_dirs[@]}"}; do
+        for profile_dir in "$saved/SaveGames"/*/; do
+            [ -d "$profile_dir" ] || continue
+            profile_dir=${profile_dir%/}
+            profile=$(basename -- "$profile_dir")
+            count=0; bytes=0; newest=0
+            for f in "$profile_dir"/*.sav; do
+                [ -f "$f" ] || continue
+                sz=$(stat_size "$f"); mt=$(stat_mtime "$f")
+                count=$((count + 1)); bytes=$((bytes + ${sz:-0}))
+                [ "${mt:-0}" -gt "$newest" ] && newest=$mt
+            done
+            [ "$count" -eq 0 ] && continue
+            bak="$saved/SaveGameBackups/$profile"
+            [ -d "$bak" ] || bak=''
+            records+=("$newest	$profile	$profile_dir	$bak	$count	$bytes")
+        done
+    done
+    [ ${#records[@]} -eq 0 ] && return 1
+    printf '%s\n' "${records[@]}" | sort -rn -k1,1 | awk -F'\t' 'BEGIN{OFS=FS} {print $2,$3,$4,$5,$6,$1}'
+}
+
+# Validate a folder the user typed in, and opportunistically pair it with a sibling
+# SaveGameBackups folder, so manual entry gets the same coverage as auto-detection.
+# Sets RESOLVED_SOURCES; prints:  savepath <TAB> count <TAB> bytes
+RESOLVED_SOURCES=()
+resolve_manual_save_path() {
+    local p; p=$(clean_path "$1")
+    [ -n "$p" ] || return 1
+    if [ ! -e "$p" ]; then bad "  That folder does not exist."; return 1; fi
+    if [ ! -d "$p" ]; then bad "  That is a file, not a folder. Enter the folder that contains your .sav files."; return 1; fi
+    [ "$p" != / ] && p=${p%/}
+
+    local count=0 bytes=0 f sz
+    for f in "$p"/*.sav; do
+        [ -f "$f" ] || continue
+        sz=$(stat_size "$f"); count=$((count + 1)); bytes=$((bytes + ${sz:-0}))
+    done
+    if [ "$count" -eq 0 ]; then
+        warn "  No .sav files in that folder."
+        local anyway; read -r -p "  Use it anyway? (y/N) " anyway
+        case "${anyway:-}" in [Yy]*) ;; *) return 1 ;; esac
+    fi
+
+    RESOLVED_SOURCES=("$p")
+    # .../Saved/SaveGames/<id>  ->  .../Saved/SaveGameBackups/<id>
+    local leaf parent sibling
+    leaf=$(basename -- "$p"); parent=$(dirname -- "$p")
+    if [ "$(basename -- "$parent")" = SaveGames ]; then
+        sibling="$(dirname -- "$parent")/SaveGameBackups/$leaf"
+        if [ -d "$sibling" ]; then
+            RESOLVED_SOURCES+=("$sibling")
+            good "  Also found the game's own backup folder - it will be watched too."
+        fi
+    fi
+    printf '%s\t%s\t%s\n' "$p" "$count" "$bytes"
+    return 0
+}
+
+# ------------------------------------------------------- processes, Steam ----
+#
+# Is the game running? Under Proton the process name is truncated to 15 characters
+# ("Voyage-Win64-Sh"), so match loosely on the recognisable part. Reading /proc/*/comm
+# with the read builtin costs no forks, which keeps this cheap enough to call often.
+game_pids() {
+    local d pid comm
+    for d in /proc/[0-9]*; do
+        pid=${d#/proc/}
+        [ "$pid" = "$$" ] && continue
+        read -r comm < "$d/comm" 2>/dev/null || continue
+        case "${comm,,}" in
+            *voyage*|*caretaker*) printf '%s\t%s\n' "$pid" "$comm" ;;
+        esac
+    done
+}
+
+game_is_running() { [ -n "$(game_pids)" ]; }
+
+# Is the game currently holding this file open FOR WRITING?
+#
+# Linux has no mandatory locking, so unlike the Windows build this cannot be answered by
+# trying to open the file - the open would simply succeed mid-write. Instead ask the
+# kernel directly: find a file descriptor in the game process pointing at this file, and
+# check its access mode. The low two bits of the flags in /proc/PID/fdinfo/N are
+# 0=O_RDONLY, 1=O_WRONLY, 2=O_RDWR, so anything non-zero means it can still be written.
+#
+# Checking the access mode rather than mere openness matters: a game that keeps a save
+# mapped or open read-only would otherwise look permanently busy and never get archived.
+file_open_for_write() {
+    local target=$1 real pid fd flags acc
+    real=$(readlink -f -- "$target" 2>/dev/null) || return 1
+    [ -n "$real" ] || return 1
+    while IFS=$'\t' read -r pid _; do
+        [ -n "$pid" ] || continue
+        [ -d "/proc/$pid/fd" ] || continue
+        while IFS= read -r fd; do
+            [ -n "$fd" ] || continue
+            flags=$(sed -n 's/^flags:[[:space:]]*//p' "/proc/$pid/fdinfo/${fd##*/}" 2>/dev/null)
+            [ -n "$flags" ] || continue
+            acc=$(( 8#$flags & 3 ))
+            [ "$acc" -ne 0 ] && return 0
+        done < <(find "/proc/$pid/fd" -maxdepth 1 -lname "$real" 2>/dev/null)
+    done < <(game_pids)
+    return 1
+}
+
+# Does this game sync its saves through Steam Cloud?
+#
+# Steam drops steam_autocloud.vdf beside the saves. Note the file STAYS after cloud is
+# turned off for the game, so this detects "this game uses Steam Cloud", not "cloud is
+# currently enabled" - the advice is worded to suit.
+steam_cloud_marker() {
+    local p
+    for p in "$@"; do
+        [ -n "$p" ] || continue
+        [ -f "$p/steam_autocloud.vdf" ] && { printf '%s' "$p/steam_autocloud.vdf"; return 0; }
+    done
+    return 1
+}
+
+# Guess whether Steam Cloud is still switched on for this game.
+#
+# Steam keeps the marker file timestamp current while it is syncing, so comparing it
+# against the newest save is more telling than the file merely existing. If you have
+# played since Steam last touched its marker, Steam is probably not syncing this game
+# any more.
+#
+# Comparing against save activity rather than the clock matters: someone who has not
+# played for a week would look "stale" by wall-clock even with cloud fully enabled.
+#
+# This is a hint, never a verdict. Wrongly telling someone cloud is off would send them
+# straight into the bug this warns about, so an inconclusive read always falls back to
+# showing the full advice.
+CLOUD_PRESENT=false
+CLOUD_VERDICT=none
+CLOUD_MARKER_TIME=''
+CLOUD_NEWEST_TIME=''
+steam_cloud_hint() {
+    CLOUD_PRESENT=false; CLOUD_VERDICT=none; CLOUD_MARKER_TIME=''; CLOUD_NEWEST_TIME=''
+    local marker; marker=$(steam_cloud_marker "$@") || return 0
+    CLOUD_PRESENT=true
+    local mt; mt=$(stat_mtime "$marker"); [ -n "$mt" ] || return 0
+    CLOUD_MARKER_TIME=$(epoch_fmt "$mt" '%Y-%m-%d %H:%M')
+
+    local newest=0 p f t
+    for p in "$@"; do
+        [ -n "$p" ] && [ -d "$p" ] || continue
+        for f in "$p"/*.sav; do
+            [ -f "$f" ] || continue
+            t=$(stat_mtime "$f"); [ "${t:-0}" -gt "$newest" ] && newest=$t
+        done
+    done
+
+    if [ "$newest" -eq 0 ]; then
+        CLOUD_VERDICT=unclear
+        return 0
+    fi
+    CLOUD_NEWEST_TIME=$(epoch_fmt "$newest" '%Y-%m-%d %H:%M')
+    # A little slack, so a save written moments before Steam synced is not read as "off".
+    if [ "$newest" -gt $((mt + 900)) ]; then CLOUD_VERDICT=likely-off; else CLOUD_VERDICT=likely-on; fi
+    return 0
+}
+
+# Steam Cloud can silently undo a restore, so say so in one place and use it everywhere.
+show_steam_cloud_advice() {
+    local short=${1:-false}
+
+    # Softer wording when the evidence suggests it is already dealt with - but never
+    # silence: a wrong "you are fine" would walk the user into the exact bug.
+    if [ "$CLOUD_VERDICT" = likely-off ]; then
+        printf '\n'
+        good "  Steam Cloud: probably already off for this game."
+        dim  "    Steam last touched its marker file on $CLOUD_MARKER_TIME,"
+        dim  "    but you have saved since then ($CLOUD_NEWEST_TIME), so it does not"
+        dim  "    look like Steam is syncing this game any more. That is a guess, not a fact."
+        if [ "$short" != true ]; then
+            printf '\n'
+            dim "    If you would rather be certain: Steam -> Library -> right-click the game"
+            dim "    -> Properties -> General -> 'Keep game saves in the Steam Cloud'."
+        fi
+        return
+    fi
+
+    if [ "$short" = true ]; then
+        warn "  Reminder: if Steam Cloud is on for this game, it can replace your restored"
+        warn "  save when the game next starts. See the README if a restore seems to undo itself."
+        return
+    fi
+
+    printf '\n'
+    warn '  ------------------------------------------------------------'
+    warn '   Worth doing: turn off Steam Cloud for this game'
+    warn '  ------------------------------------------------------------'
+    printf '\n'
+    dim "  This game can sync its saves through Steam Cloud. That works against you"
+    dim "  when restoring: if Steam decides its cloud copy is newer than the save you"
+    dim "  just put back, it can overwrite your restored save when the game starts -"
+    dim "  so the restore looks like it silently failed."
+    printf '\n'
+    say  "  To turn it off for this one game:"
+    info "    Steam  ->  Library  ->  right-click the game  ->  Properties"
+    info "           ->  General  ->  untick 'Keep game saves in the Steam Cloud'"
+    printf '\n'
+    dim "  You lose nothing by doing this. Your saves stay on this PC and SeedVault"
+    dim "  keeps its own full history. It only stops Steam syncing THIS game's saves"
+    dim "  between computers - every other game is unaffected."
+    printf '\n'
+    if [ -n "$CLOUD_MARKER_TIME" ]; then
+        dim "  (Steam last touched its marker file here on $CLOUD_MARKER_TIME -"
+        dim "   recent enough that it may still be syncing. Steam leaves that file behind"
+        dim "   even once cloud is off, so this is a hint rather than a reading of your"
+        dim "   actual setting.)"
+    else
+        dim "  (Steam leaves its marker file behind either way, so this tool cannot tell"
+        dim "   whether you have already turned it off.)"
+    fi
+}
+
+# ============================================================== THE MONITOR ==
+#
+# Watches the save folder(s) and copies every new or modified save into a timestamped
+# vault. Vault files are NEVER overwritten and never deleted.
+
+# A save must look identical for this many consecutive polls before the write is trusted
+# to have finished. Saves are tens of megabytes and take real time to land on disk.
+REQUIRED_STABLE_POLLS=2
+
+# How many polls to keep deferring to a game that still has the save open for writing,
+# before storing it anyway. Windows can ask the filesystem to refuse a read mid-write;
+# Linux cannot, so the busy check here is advisory. Waiting forever on a false positive
+# would mean never archiving at all - far worse than a copy that the post-copy
+# re-verification would catch and retry anyway.
+MAX_BUSY_POLLS=30
+
+declare -A KNOWN_HASHES=()
+declare -A LAST_SEEN=()
+declare -A STABLE_COUNT=()
+declare -A HANDLED=()
+declare -A BUSY_WAITS=()
+COPY_COUNT=0
+DUP_COUNT=0
+
+VAULT=''
+MANIFEST_PATH=''
+HASH_INDEX_PATH=''
+LOG_PATH=''
+LOG_MAX_BYTES=$((5 * 1024 * 1024))
+QUIET=false
+LOCK_FD=''
+
+# ---------------------------------------------------------------- logging ----
+
+log() {
+    local level=${1:-INFO} msg=${2:-}
+    local line; line="$(now_stamp) [$level] $msg"
+    if [ "$QUIET" != true ]; then
+        case "$level" in
+            COPY)  good "$line" ;;
+            SKIP)  dim  "$line" ;;
+            WARN)  warn "$line" ;;
+            ERROR) bad  "$line" ;;
+            *)     say  "$line" ;;
+        esac
+    fi
+    # A logging failure must never take down the monitor.
+    {
+        if [ -f "$LOG_PATH" ]; then
+            local sz; sz=$(stat_size "$LOG_PATH")
+            if [ "${sz:-0}" -gt "$LOG_MAX_BYTES" ]; then
+                mv -f -- "$LOG_PATH" "$VAULT/_log.1.txt" 2>/dev/null
+            fi
+        fi
+        printf '%s\n' "$line" >> "$LOG_PATH"
+    } 2>/dev/null
+}
+
+# --------------------------------------------------------------- manifest ----
+
+csv_field() {
+    local v=${1:-}
+    v=${v//\"/\"\"}
+    printf '"%s"' "$v"
+}
+
+manifest_row() {
+    # origin, source file, archived path, bytes, sha256, source last write, status
+    {
+        printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+            "$(csv_field "$(now_iso_utc)")" "$(csv_field "$1")" "$(csv_field "$2")" \
+            "$(csv_field "$3")" "$(csv_field "$4")" "$(csv_field "$5")" \
+            "$(csv_field "$6")" "$(csv_field "$7")"
+    } >> "$MANIFEST_PATH" 2>/dev/null
+}
+
+remember_hash() {
+    local hash=$1 path=$2
+    KNOWN_HASHES["$hash"]=$path
+    printf '%s\t%s\n' "$hash" "$path" >> "$HASH_INDEX_PATH" 2>/dev/null
+}
+
+# ------------------------------------------------------------------- lock ----
+#
+# The lock lives in the vault, not under the app, so it is keyed on the thing that must
+# not be raced on. Two monitors writing to one vault would collide on the same temporary
+# file and could commit a mixed-content save that still passed its length check -
+# corruption in the one place that must never have any. Keying on the vault means any
+# second monitor for this vault backs off, whichever install it came from, while a
+# monitor for a different vault is free to run alongside.
+acquire_vault_lock() {
+    local lock="$VAULT/_lock"
+    if command -v flock >/dev/null 2>&1; then
+        exec {LOCK_FD}>"$lock" || return 1
+        # The lock is the open file descriptor itself, so the file stays empty. Nothing
+        # needs to be written into it, and writing would only invite a second redirection
+        # racing with the one holding the lock.
+        flock -n "$LOCK_FD" || return 1
+        return 0
+    fi
+    # Without flock, fall back to an atomic mkdir plus a liveness check, so a monitor
+    # killed without cleanup cannot lock the vault out forever.
+    local lockdir="$lock.d"
+    if mkdir "$lockdir" 2>/dev/null; then
+        printf '%s\n' "$$" > "$lockdir/pid"
+        LOCK_FD=dir
+        return 0
+    fi
+    local other; other=$(cat "$lockdir/pid" 2>/dev/null)
+    if [ -n "$other" ] && [ ! -d "/proc/$other" ] && ! kill -0 "$other" 2>/dev/null; then
+        rm -rf -- "$lockdir" 2>/dev/null
+        if mkdir "$lockdir" 2>/dev/null; then
+            printf '%s\n' "$$" > "$lockdir/pid"
+            LOCK_FD=dir
+            return 0
+        fi
+    fi
+    return 1
+}
+
+release_vault_lock() {
+    if [ "$LOCK_FD" = dir ]; then
+        rm -rf -- "$VAULT/_lock.d" 2>/dev/null
+    elif [ -n "$LOCK_FD" ]; then
+        exec {LOCK_FD}>&- 2>/dev/null
+    fi
+    LOCK_FD=''
+}
+
+# ------------------------------------------------------------------ setup ----
+
+init_vault() {
+    if [ ! -d "$VAULT" ]; then
+        mkdir -p -- "$VAULT" || die "Could not create the vault at $VAULT"
+        log INFO "Created vault: $VAULT"
+    fi
+
+    # Partial copies from an interrupted run are never valid saves.
+    local t
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        rm -f -- "$t" 2>/dev/null
+        log WARN "Removed stale partial copy: $(basename -- "$t")"
+    done < <(find "$VAULT" -type f -name '*.tmp' 2>/dev/null)
+
+    if [ -f "$HASH_INDEX_PATH" ]; then
+        local h p n=0
+        while IFS=$'\t' read -r h p; do
+            [ -n "$h" ] || continue
+            KNOWN_HASHES["$h"]=$p
+            n=$((n + 1))
+        done < "$HASH_INDEX_PATH"
+        log INFO "Loaded $n known save states."
+        return
+    fi
+
+    if [ ! -f "$MANIFEST_PATH" ]; then
+        printf 'ArchivedAtUtc,Origin,SourceFile,ArchivedPath,Bytes,Sha256,SourceLastWrite,Status\n' \
+            > "$MANIFEST_PATH" 2>/dev/null
+    fi
+
+    # Adopt anything already in the vault - the snapshot setup takes, or a vault carried
+    # over from another machine - so those states count toward dedupe instead of being
+    # stored a second time.
+    local -a existing=()
+    while IFS= read -r t; do [ -n "$t" ] && existing+=("$t"); done < <(vault_save_files)
+    if [ ${#existing[@]} -gt 0 ]; then
+        log INFO "Indexing ${#existing[@]} file(s) already in the vault..."
+        local f hash sz mt
+        for f in "${existing[@]}"; do
+            hash=$(sha256_of "$f") || continue
+            [ -n "$hash" ] || continue
+            [ -n "${KNOWN_HASHES[$hash]:-}" ] && continue
+            sz=$(stat_size "$f"); mt=$(stat_mtime "$f")
+            remember_hash "$hash" "$f"
+            manifest_row snapshot "$(basename -- "$f")" "$f" "${sz:-0}" "$hash" \
+                "$(epoch_fmt "${mt:-0}" '%Y-%m-%dT%H:%M:%S%z')" SNAPSHOT
+        done
+        log INFO "Indexed ${#KNOWN_HASHES[@]} distinct save states."
+    fi
+}
+
+# Every .sav in the vault, excluding the lock and other bookkeeping.
+vault_save_files() {
+    find "$VAULT" -type f -name '*.sav' 2>/dev/null | sort
+}
+
+# ---------------------------------------------------------------- storing ----
+
+origin_of() {
+    case "$1" in
+        *SaveGameBackups*) printf 'game-backup' ;;
+        *)                 printf 'save' ;;
+    esac
+}
+
+# Files the game already stamped keep their own name. Ours get the save's own modified
+# time - the moment you were actually at that point, not the moment it was copied. So
+# sorting by name and sorting by date give the same answer, which is what you want when
+# hunting for "where I was about an hour ago".
+vault_target_for() {
+    local file=$1 mtime=$2
+    local name day leaf ext base
+    name=$(basename -- "$file")
+    ext=''
+    case "$name" in *.*) ext=".${name##*.}" ;; esac
+    base=${name%"$ext"}
+
+    if [[ $base =~ _([0-9]{4}-[0-9]{2}-[0-9]{2})_[0-9]{2}_[0-9]{2}_[0-9]{2}$ ]]; then
+        day=${BASH_REMATCH[1]}
+        leaf=$base
+    else
+        day=$(epoch_fmt "$mtime" '%Y-%m-%d')
+        leaf="${base}__$(epoch_fmt "$mtime" '%Y-%m-%d_%H-%M-%S')"
+    fi
+
+    local dir="$VAULT/$day"
+    mkdir -p -- "$dir" 2>/dev/null || return 1
+
+    # An existing file is NEVER a write target. Suffix until the name is free.
+    local target="$dir/$leaf$ext" n=2
+    while [ -e "$target" ]; do
+        target="$dir/${leaf}_${n}${ext}"
+        n=$((n + 1))
+    done
+    printf '%s' "$target"
+}
+
+store_copy() {
+    local src=$1
+    local origin; origin=$(origin_of "$src")
+    local before_len before_time
+    before_len=$(stat_size "$src") || return 1
+    before_time=$(stat_mtime "$src") || return 1
+    [ -n "$before_len" ] && [ -n "$before_time" ] || return 1
+
+    local target; target=$(vault_target_for "$src" "$before_time") || return 1
+    local tmp="$target.tmp"
+
+    cp -p -- "$src" "$tmp" 2>/dev/null || {
+        rm -f -- "$tmp" 2>/dev/null
+        log ERROR "Could not copy $(basename -- "$src")."
+        return 1
+    }
+
+    # If the game rewrote the file mid-copy, what was captured is untrustworthy.
+    local after_len after_time
+    after_len=$(stat_size "$src"); after_time=$(stat_mtime "$src")
+    if [ "$after_len" != "$before_len" ] || [ "$after_time" != "$before_time" ]; then
+        rm -f -- "$tmp" 2>/dev/null
+        log WARN "$(basename -- "$src") changed while copying - will retry."
+        return 1
+    fi
+
+    local tmp_len; tmp_len=$(stat_size "$tmp")
+    if [ "${tmp_len:-0}" != "$before_len" ]; then
+        rm -f -- "$tmp" 2>/dev/null
+        log ERROR "$(basename -- "$src") short copy (${tmp_len:-0} vs $before_len) - discarded."
+        return 1
+    fi
+
+    # Hash the copy rather than the source, so the hash always describes the stored bytes.
+    local hash; hash=$(sha256_of "$tmp")
+    if [ -z "$hash" ]; then
+        rm -f -- "$tmp" 2>/dev/null
+        log ERROR "Could not hash the copy of $(basename -- "$src") - discarded."
+        return 1
+    fi
+
+    local src_written; src_written=$(epoch_fmt "$before_time" '%Y-%m-%dT%H:%M:%S%z')
+
+    if is_true "$CFG_DEDUPE" && [ -n "${KNOWN_HASHES[$hash]:-}" ]; then
+        local existing_path=${KNOWN_HASHES[$hash]}
+        rm -f -- "$tmp" 2>/dev/null
+        manifest_row "$origin" "$(basename -- "$src")" "$existing_path" "$before_len" "$hash" \
+            "$src_written" "DUPLICATE-OF:$existing_path"
+        DUP_COUNT=$((DUP_COUNT + 1))
+        log SKIP "SKIP $(basename -- "$src") - already stored as $(basename -- "$existing_path")"
+        return 0
+    fi
+
+    # Hard-linking the temporary file into place fails outright if the name is taken,
+    # which is the point: there is no code path here that can overwrite a vault file.
+    # (mv would happily clobber, and 'mv -n' fails silently instead of telling us.)
+    local n=2 dir leaf ext base
+    dir=$(dirname -- "$target"); base=$(basename -- "$target")
+    ext=''; case "$base" in *.*) ext=".${base##*.}" ;; esac
+    leaf=${base%"$ext"}
+    while ! ln -- "$tmp" "$target" 2>/dev/null; do
+        if [ ! -e "$target" ]; then
+            # Not a name collision - the filesystem refused the link (some network and
+            # FUSE mounts do). Fall back to a copy, still never onto an existing name.
+            cp -p -- "$tmp" "$target" 2>/dev/null && break
+            rm -f -- "$tmp" 2>/dev/null
+            log ERROR "Could not place $(basename -- "$src") into the vault."
+            return 1
+        fi
+        target="$dir/${leaf}_${n}${ext}"
+        n=$((n + 1))
+        if [ "$n" -gt 200 ]; then
+            rm -f -- "$tmp" 2>/dev/null
+            log ERROR "Could not find a free name for $(basename -- "$src")."
+            return 1
+        fi
+    done
+    rm -f -- "$tmp" 2>/dev/null
+
+    touch -r "$src" -- "$target" 2>/dev/null
+    is_true "$CFG_READONLY" && chmod a-w -- "$target" 2>/dev/null
+
+    remember_hash "$hash" "$target"
+    COPY_COUNT=$((COPY_COUNT + 1))
+    manifest_row "$origin" "$(basename -- "$src")" "$target" "$before_len" "$hash" \
+        "$src_written" COPIED
+
+    log COPY "SAVED $(basename -- "$src") -> ${target#"$VAULT"/}  ($(fmt_size "$before_len"))"
+    return 0
+}
+
+# ------------------------------------------------------------------- poll ----
+
+poll_once() {
+    local -A live=()
+    local dir f key sig sz mt
+
+    for dir in "${CFG_SOURCE_PATHS[@]}"; do
+        [ -d "$dir" ] || continue
+        for f in "$dir"/$CFG_FILE_PATTERN; do
+            [ -f "$f" ] || continue
+            key=$f
+            live["$key"]=1
+            sz=$(stat_size "$f"); mt=$(stat_mtime "$f")
+            [ -n "$sz" ] && [ -n "$mt" ] || continue
+            sig="$sz|$mt"
+
+            # Already stored this exact version - do not re-copy it every poll.
+            [ "${HANDLED[$key]:-}" = "$sig" ] && continue
+
+            if [ "${LAST_SEEN[$key]:-}" = "$sig" ]; then
+                STABLE_COUNT["$key"]=$(( ${STABLE_COUNT[$key]:-0} + 1 ))
+            else
+                LAST_SEEN["$key"]=$sig
+                STABLE_COUNT["$key"]=1
+                continue   # it just changed - let it settle before touching it
+            fi
+
+            [ "${STABLE_COUNT[$key]}" -lt "$REQUIRED_STABLE_POLLS" ] && continue
+
+            if file_open_for_write "$f"; then
+                BUSY_WAITS["$key"]=$(( ${BUSY_WAITS[$key]:-0} + 1 ))
+                if [ "${BUSY_WAITS[$key]}" -lt "$MAX_BUSY_POLLS" ]; then
+                    if [ $(( ${BUSY_WAITS[$key]} % 15 )) -eq 0 ]; then
+                        log WARN "$(basename -- "$f") is still open for writing by the game - waiting."
+                    fi
+                    continue   # keep retrying; never abandon a save
+                fi
+                log WARN "$(basename -- "$f") has looked settled for a while but the game still has it open - storing it anyway."
+            fi
+            BUSY_WAITS["$key"]=0
+
+            # Only mark handled when it genuinely succeeded, so a failure retries on the
+            # next poll instead of silently dropping the save.
+            if store_copy "$f"; then
+                HANDLED["$key"]=$sig
+            fi
+            STABLE_COUNT["$key"]=0
+        done
+    done
+
+    # Forget files the game rotated away, so these tables cannot grow forever.
+    for key in "${!LAST_SEEN[@]}"; do
+        [ -n "${live[$key]:-}" ] && continue
+        unset "LAST_SEEN[$key]" "STABLE_COUNT[$key]" "HANDLED[$key]" "BUSY_WAITS[$key]"
+    done
+}
+
+check_space() {
+    local free; free=$(drive_free_bytes "$VAULT") || return 0
+    [ -n "$free" ] || return 0
+    local floor=$((CFG_MIN_FREE_GB * 1024 * 1024 * 1024))
+    if [ "$free" -lt "$floor" ]; then
+        log WARN "LOW DISK SPACE: $(fmt_size "$free") free on the vault drive. Still archiving - free some space."
+    fi
+}
+
+run_prune() {
+    [ "${CFG_PRUNE_AFTER_DAYS:-0}" -gt 0 ] || return 0   # 0 = keep everything, the default
+    local f
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        chmod u+w -- "$f" 2>/dev/null
+        if rm -f -- "$f" 2>/dev/null; then
+            log WARN "Pruned (older than $CFG_PRUNE_AFTER_DAYS days): $(basename -- "$f")"
+        else
+            log ERROR "Could not prune $(basename -- "$f")."
+        fi
+    done < <(find "$VAULT" -type f -name '*.sav' -mtime "+$CFG_PRUNE_AFTER_DAYS" 2>/dev/null)
+}
+
+# Bash will not run a trap while it is waiting for a foreground command, so a plain
+# 'sleep 4' between polls would swallow the stop signal for up to a full poll interval -
+# long enough that 'uninstall' would report the monitor stopped while it was still
+# running. Backgrounding the sleep and waiting on it makes the signal land immediately.
+SLEEP_PID=''
+interruptible_sleep() {
+    sleep "$1" &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" 2>/dev/null
+    SLEEP_PID=''
+}
+
+watcher_shutdown() {
+    [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
+    log INFO "=== Stopping on request ==="
+    release_vault_lock
+    exit 0
+}
+
+cmd_watch() {
+    local once=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --once)         once=true ;;
+            --quiet)        QUIET=true ;;
+            --source)       shift; CLI_SOURCE_LIST+=("$(clean_path "${1:-}")") ;;
+            --vault)        shift; CLI_VAULT=$(clean_path "${1:-}") ;;
+            --poll)         shift; CLI_POLL=${1:-} ;;
+            --pattern)      shift; CLI_PATTERN=${1:-} ;;
+            --no-dedupe)    CLI_DEDUPE=false ;;
+            --no-readonly)  CLI_READONLY=false ;;
+            *) die "watch: unknown option '$1'" ;;
+        esac
+        shift
+    done
+    die_unless_configured
+    [ -n "${CLI_POLL:-}" ]    && CFG_POLL_SECONDS=$CLI_POLL
+    [ -n "${CLI_PATTERN:-}" ] && CFG_FILE_PATTERN=$CLI_PATTERN
+    [ "${CLI_DEDUPE:-}" = false ]   && CFG_DEDUPE=false
+    [ "${CLI_READONLY:-}" = false ] && CFG_READONLY=false
+
+    VAULT=$CFG_ARCHIVE_PATH
+    MANIFEST_PATH="$VAULT/_manifest.csv"
+    HASH_INDEX_PATH="$VAULT/_hashes.tsv"
+    LOG_PATH="$VAULT/_log.txt"
+
+    mkdir -p -- "$VAULT" || die "Could not create the vault at $VAULT"
+
+    if ! acquire_vault_lock; then
+        warn "Another $APP_NAME monitor is already watching this vault:"
+        warn "  $VAULT"
+        warn "Nothing to do - the saves are already being looked after."
+        exit 2
+    fi
+    trap watcher_shutdown TERM INT HUP
+
+    init_vault
+    log INFO "=== $APP_NAME v$APP_VERSION started (every ${CFG_POLL_SECONDS}s) ==="
+    local s state
+    for s in "${CFG_SOURCE_PATHS[@]}"; do
+        if [ -d "$s" ]; then state=watching; else state='not found yet'; fi
+        log INFO "  $state : $s"
+    done
+    log INFO "  vault    : $VAULT"
+
+    if [ "$once" = true ]; then
+        local i
+        for (( i = 0; i < REQUIRED_STABLE_POLLS + 2; i++ )); do
+            poll_once
+            sleep 0.4 2>/dev/null || sleep 1
+        done
+        log INFO "=== Done: $COPY_COUNT stored, $DUP_COUNT already had ==="
+        release_vault_lock
+        return 0
+    fi
+
+    local tick=0
+    while true; do
+        # The loop must never die and leave saves unprotected.
+        poll_once || log ERROR "Poll error (continuing)."
+        tick=$((tick + 1))
+        [ $((tick % 150)) -eq 0 ] && check_space
+        [ $((tick % 900)) -eq 0 ] && run_prune
+        interruptible_sleep "$CFG_POLL_SECONDS"
+    done
+}
+
+# =================================================================== SHARED ==
+
+CLI_SOURCE_LIST=()
+CLI_VAULT=''
+CLI_POLL=''
+CLI_PATTERN=''
+CLI_DEDUPE=''
+CLI_READONLY=''
+
+# Command-line paths win over the config, which is how the self-test drives the monitor
+# against throwaway folders without touching a real install.
+die_unless_configured() {
+    if [ ${#CLI_SOURCE_LIST[@]} -gt 0 ] && [ -n "$CLI_VAULT" ]; then
+        CFG_SOURCE_PATHS=("${CLI_SOURCE_LIST[@]}")
+        CFG_ARCHIVE_PATH=$CLI_VAULT
+        return 0
+    fi
+    read_config || die "Not set up on this machine yet. Run:  $APP_SLUG setup"
+    [ ${#CLI_SOURCE_LIST[@]} -gt 0 ] && CFG_SOURCE_PATHS=("${CLI_SOURCE_LIST[@]}")
+    [ -n "$CLI_VAULT" ] && CFG_ARCHIVE_PATH=$CLI_VAULT
+    [ ${#CFG_SOURCE_PATHS[@]} -gt 0 ] || die "No folders to watch. Run:  $APP_SLUG setup"
+    return 0
+}
+
+# mtime <TAB> size <TAB> path, for every .sav under a folder. One or two forks total,
+# rather than one per file - a long-lived vault holds thousands.
+if stat -c '%Y' . >/dev/null 2>&1; then
+    list_saves_with_stat() { find "$1" -type f -name '*.sav' -exec stat -c '%Y	%s	%n' {} + 2>/dev/null; }
+else
+    list_saves_with_stat() { find "$1" -type f -name '*.sav' -exec stat -f '%m	%z	%N' {} + 2>/dev/null; }
+fi
+
+# Which processes are running the monitor right now? The live process is the authority,
+# not the service state: systemd can report the unit active while the monitor is between
+# restarts, and a monitor started by hand has no unit at all.
+monitor_pids() {
+    local d pid cmd
+    for d in /proc/[0-9]*; do
+        pid=${d#/proc/}
+        [ "$pid" = "$$" ] && continue
+        cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+        case "$cmd" in
+            *"$APP_SLUG"*watch*) printf '%s\n' "$pid" ;;
+        esac
+    done
+}
+
+# ================================================================== RESTORE ==
+
+# Our naming:            <slot>__2026-08-27_08-30-57[_2].sav
+# The game's own naming: <slot>_2026-08-27_08_16_21[_2].sav
+slot_name_of() {
+    local name=$1
+    if [[ $name =~ ^(.+)__[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}(_[0-9]+)?\.[^.]+$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"; return
+    fi
+    if [[ $name =~ ^(.+)_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}_[0-9]{2}_[0-9]{2}(_[0-9]+)?\.[^.]+$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"; return
+    fi
+    printf '%s' "${name%.*}"
+}
+
+# Split "76561197961167679_AutoSave_0" into its profile id and its slot designator.
+# Autosave has to be checked first, or the trailing digit of "AutoSave_0" would be
+# mistaken for the slot number.
+SPLIT_PROFILE=''
+SPLIT_DESIGNATOR=''
+split_slot_name() {
+    local s=$1
+    if [[ $s =~ ^(.*)_(AutoSave_[0-9]+)$ ]]; then
+        SPLIT_PROFILE=${BASH_REMATCH[1]}; SPLIT_DESIGNATOR=${BASH_REMATCH[2]}; return
+    fi
+    if [[ $s =~ ^(.*)_([0-9]+)$ ]]; then
+        SPLIT_PROFILE=${BASH_REMATCH[1]}; SPLIT_DESIGNATOR=${BASH_REMATCH[2]}; return
+    fi
+    SPLIT_PROFILE=$s; SPLIT_DESIGNATOR=''
+}
+
+# Accept "2", "slot 2", "auto", "autosave", "auto_1" and so on.
+resolve_slot_designator() {
+    local t=$1
+    t="${t#"${t%%[![:space:]]*}"}"; t="${t%"${t##*[![:space:]]}"}"
+    [ -n "$t" ] || return 1
+    local lower=${t,,}
+    if [[ $lower =~ ^(slot[[:space:]_-]*)?a(uto)?(save)?(_?[0-9]+)?$ ]]; then
+        if [[ $lower =~ ([0-9]+)$ ]]; then printf 'AutoSave_%s' "${BASH_REMATCH[1]}"; else printf 'AutoSave_0'; fi
+        return 0
+    fi
+    if [[ $t =~ ([0-9]+)[[:space:]]*$ ]]; then printf '%s' "${BASH_REMATCH[1]}"; return 0; fi
+    return 1
+}
+
+# Just the slot part, for the listing. Every row carries the same profile id, so showing
+# it on all of them costs a lot of width and tells you nothing.
+slot_display() {
+    split_slot_name "$1"
+    if [ -n "$SPLIT_DESIGNATOR" ]; then printf '%s' "$SPLIT_DESIGNATOR"; else printf '%s' "$1"; fi
+}
+
+# Show what is in each slot right now, so picking a target is an informed choice.
+show_current_slots() {
+    local save_path=$1 f d
+    printf '\n'
+    info "  Slots in use right now:"
+    local any=false
+    for f in "$save_path"/*.sav; do
+        [ -f "$f" ] || continue
+        any=true
+        split_slot_name "$(basename -- "${f%.*}")"
+        d=$SPLIT_DESIGNATOR
+        printf '    slot %-12s %9s   last saved %s\n' "$d" "$(fmt_size "$(stat_size "$f")")" "$(fmt_mtime "$f")"
+    done
+    [ "$any" = false ] && dim "    (none)"
+}
+
+cmd_restore() {
+    local slot_filter='' last=30 index=0 to_slot='' assume_yes=false
+    local vault_path='' save_path='' to_slot_given=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slot)      shift; slot_filter=${1:-} ;;
+            --last)      shift; last=${1:-30} ;;
+            --index|-i)  shift; index=${1:-0} ;;
+            --to-slot)   shift; to_slot=${1:-}; to_slot_given=true ;;
+            --yes|-y)    assume_yes=true ;;
+            --vault)     shift; vault_path=$(clean_path "${1:-}") ;;
+            --save-path) shift; save_path=$(clean_path "${1:-}") ;;
+            -h|--help)   say "Usage: $APP_SLUG restore [--index N] [--to-slot N|auto] [--slot NAME] [--last N] [--yes]"; return 0 ;;
+            *) die "restore: unknown option '$1'" ;;
+        esac
+        shift
+    done
+
+    if [ -z "$vault_path" ] || [ -z "$save_path" ]; then
+        read_config || die "Not set up on this machine yet. Run:  $APP_SLUG setup"
+        [ -n "$vault_path" ] || vault_path=$CFG_ARCHIVE_PATH
+        # The first watched folder is the live save folder; the rest are game backups.
+        [ -n "$save_path" ] || save_path=${CFG_SOURCE_PATHS[0]:-}
+    fi
+    [ -n "$save_path" ] || die "Do not know where your live saves are. Run:  $APP_SLUG setup"
+
+    banner 'Restore'
+
+    # Restoring underneath a running game means the game overwrites it moments later.
+    if [ "$assume_yes" != true ] && game_is_running; then
+        bad "  The game appears to be running."
+        bad "  Close it first, or it will overwrite whatever you restore."
+        printf '\n'
+        local go; read -r -p "  Type CONTINUE to restore anyway, or press Enter to stop: " go
+        [ "$go" = CONTINUE ] || { say '  Stopped. Nothing was changed.'; return 0; }
+    fi
+
+    [ -d "$vault_path" ] || die "Vault not found: $vault_path"
+
+    local -a paths=() sizes=() times=()
+    local mt sz p
+    while IFS=$'\t' read -r mt sz p; do
+        [ -n "$p" ] || continue
+        if [ -n "$slot_filter" ]; then
+            case "$(slot_name_of "$(basename -- "$p")")" in *"$slot_filter"*) ;; *) continue ;; esac
+        fi
+        paths+=("$p"); sizes+=("$sz"); times+=("$mt")
+    done < <(list_saves_with_stat "$vault_path" | sort -rn -k1,1)
+
+    local total=${#paths[@]}
+    if [ "$total" -eq 0 ]; then
+        warn "  Nothing in the vault yet."
+        [ -n "$slot_filter" ] && dim "  (Filtering on '$slot_filter' - try without --slot.)"
+        return 0
+    fi
+
+    local shown=$total
+    [ "$last" -gt 0 ] && [ "$shown" -gt "$last" ] && shown=$last
+
+    info "  Saves in the vault, newest first:"
+    printf '\n'
+    dim '     #   When                    Size      Slot'
+    dim '   ---   -------------------   --------   ----------------'
+    local i
+    for (( i = 0; i < shown; i++ )); do
+        printf '   %3d   %s   %8s   %s\n' "$((i + 1))" \
+            "$(epoch_fmt "${times[$i]}" '%Y-%m-%d %H:%M:%S')" \
+            "$(fmt_size "${sizes[$i]}")" \
+            "$(slot_display "$(slot_name_of "$(basename -- "${paths[$i]}")")")"
+    done
+    if [ "$total" -gt "$shown" ]; then
+        printf '\n'
+        dim "   ... and $((total - shown)) older. Use --last $total to see them all."
+    fi
+
+    printf '\n'
+    local idx=0
+    if [ "$index" -gt 0 ]; then
+        idx=$index
+        if [ "$idx" -gt "$shown" ]; then
+            bad "  There is no entry number $idx (only $shown listed)."
+            return 1
+        fi
+        info "  Restoring entry $idx (chosen with --index)."
+    else
+        local pick; read -r -p "  Restore which number? (Enter to cancel): " pick
+        [ -n "${pick:-}" ] || { say '  Cancelled.'; return 0; }
+        if ! [[ $pick =~ ^[0-9]+$ ]] || [ "$pick" -lt 1 ] || [ "$pick" -gt "$shown" ]; then
+            bad "  '$pick' isn't one of the numbers listed."
+            return 1
+        fi
+        idx=$pick
+    fi
+
+    local chosen=${paths[$((idx - 1))]}
+    local chosen_name; chosen_name=$(basename -- "$chosen")
+    local chosen_ext=''; case "$chosen_name" in *.*) chosen_ext=".${chosen_name##*.}" ;; esac
+    split_slot_name "$(slot_name_of "$chosen_name")"
+    local profile=$SPLIT_PROFILE from_slot=$SPLIT_DESIGNATOR
+    local target_slot=$from_slot
+
+    # ---- which slot should it go into? ----
+    if [ "$to_slot_given" = true ] && [ -n "$to_slot" ]; then
+        target_slot=$(resolve_slot_designator "$to_slot") || {
+            bad "  '$to_slot' is not a slot I understand."; return 1; }
+    elif [ "$assume_yes" != true ]; then
+        printf '\n'
+        info "  This save came from slot '$from_slot'."
+        show_current_slots "$save_path"
+        printf '\n'
+        dim "  Press Enter to put it back in slot '$from_slot', or type another slot"
+        dim "  (a number like 0, 1, 2, 3 - or 'auto' for the autosave slot)."
+        local answer; read -r -p "  Slot: " answer
+        if [ -n "${answer:-}" ]; then
+            target_slot=$(resolve_slot_designator "$answer") || {
+                bad "  '$answer' is not a slot I understand. Nothing was changed."; return 1; }
+        fi
+    fi
+
+    local target="$save_path/${profile}_${target_slot}${chosen_ext}"
+
+    printf '\n'
+    good "   Restoring : $chosen_name"
+    good "   From      : $(fmt_mtime "$chosen")"
+    if [ "$target_slot" != "$from_slot" ]; then
+        warn "   Into slot : $target_slot   (originally slot $from_slot)"
+    else
+        warn "   Into slot : $target_slot"
+    fi
+    dim  "   File      : $target"
+    if [ -e "$target" ]; then
+        warn "   Replacing : $(fmt_size "$(stat_size "$target")") from $(fmt_mtime "$target")"
+        dim  "               (this will be kept in the vault, not lost)"
+    fi
+
+    if [ "$target_slot" != "$from_slot" ]; then
+        printf '\n'
+        warn "   Heads up: a save records inside itself which slot it belongs to, and"
+        warn "   that stays saying '$from_slot'. The game will load it from slot $target_slot fine,"
+        warn "   but if it uses that internal value when saving, your next save could"
+        warn "   land back in slot $from_slot. After loading, save once and check which slot"
+        warn "   actually changed. Nothing can be lost either way - it is all in the vault."
+    fi
+    case "$target_slot" in
+        AutoSave*)
+            printf '\n'
+            warn "   Note: the game overwrites the autosave slot on its own schedule, so a"
+            warn "   save restored there may not survive long. A numbered slot is safer."
+            ;;
+    esac
+
+    # The moment this actually bites is right here, so mention it here rather than only
+    # in a README the user reads after a restore has already reverted on them.
+    steam_cloud_hint "$save_path"
+    if [ "$CLOUD_PRESENT" = true ]; then
+        printf '\n'
+        show_steam_cloud_advice true
+    fi
+
+    printf '\n'
+    if [ "$assume_yes" != true ]; then
+        local confirm; read -r -p "  Type YES to go ahead: " confirm
+        [ "$confirm" = YES ] || { say '  Cancelled. Nothing was changed.'; return 0; }
+    fi
+
+    # Never destroy the present to recover the past.
+    if [ -e "$target" ]; then
+        local safety_dir
+        safety_dir="$vault_path/_before-restore/$(date '+%Y-%m-%d_%H-%M-%S')"
+        mkdir -p -- "$safety_dir" || die "Could not create $safety_dir"
+        cp -p -- "$target" "$safety_dir/$(basename -- "$target")" || die "Could not keep a copy of your current save - stopping before anything is replaced."
+        printf '\n'
+        info "  Your current save was kept here:"
+        info "    $safety_dir"
+    fi
+
+    mkdir -p -- "$save_path" 2>/dev/null
+    # The live save may be read-only from an earlier restore; cp cannot write over that.
+    [ -e "$target" ] && chmod u+w -- "$target" 2>/dev/null
+    cp -- "$chosen" "$target" || die "Could not write $target"
+
+    # Vault files are read-only, and that flag can travel with the copy. A read-only save
+    # would stop the game writing to that slot at all.
+    chmod u+w -- "$target" 2>/dev/null
+    touch -r "$chosen" -- "$target" 2>/dev/null
+
+    printf '\n'
+    good "  Done. Start the game and load slot $target_slot."
+    if [ "$target_slot" != "$from_slot" ]; then
+        warn "  Remember to check which slot your next in-game save writes to."
+    fi
+    printf '\n'
+    return 0
+}
+
+# =================================================================== STATUS ==
+
+autostart_method() {
+    if [ -f "$SERVICE_PATH" ]; then
+        printf 'starts at login as a systemd user service, restarts itself if it ever dies'
+    elif [ -f "$AUTOSTART_PATH" ]; then
+        printf 'starts from your desktop autostart folder'
+    else
+        printf 'no automatic start configured'
+    fi
+}
+
+cmd_status() {
+    local self_test=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --self-test|--selftest) self_test=true ;;
+            -h|--help) say "Usage: $APP_SLUG status [--self-test]"; return 0 ;;
+            *) die "status: unknown option '$1'" ;;
+        esac
+        shift
+    done
+
+    banner 'Status'
+
+    if ! read_config; then
+        warn "  Not set up on this machine yet. Run:  $APP_SLUG setup"
+        printf '\n'
+        # --self-test still runs: checking the tool works before installing it is
+        # a perfectly reasonable thing to want to do.
+        [ "$self_test" = true ] || return 0
+    fi
+
+    if [ "$CFG_LOADED" = true ]; then
+        local -a pids=()
+        local p
+        while IFS= read -r p; do [ -n "$p" ] && pids+=("$p"); done < <(monitor_pids)
+
+        if [ ${#pids[@]} -gt 0 ]; then
+            good "  MONITOR: running  ($(autostart_method))"
+        else
+            bad "  MONITOR: NOT RUNNING"
+            bad "  Your saves are not being protected right now."
+            if [ -f "$SERVICE_PATH" ]; then
+                warn "  Start it again with:  systemctl --user start $SERVICE_NAME"
+                warn "  Or see why it stopped: journalctl --user -u $SERVICE_NAME -n 50"
+            else
+                warn "  Run '$APP_SLUG setup' again to fix it."
+            fi
+        fi
+
+        printf '\n'
+        say "  Vault    : $CFG_ARCHIVE_PATH"
+        local s mark
+        for s in "${CFG_SOURCE_PATHS[@]}"; do
+            if [ -d "$s" ]; then mark=' '; else mark='!'; fi
+            say "  Watching$mark: $s"
+        done
+
+        if [ -d "$CFG_ARCHIVE_PATH" ]; then
+            local count=0 bytes=0 newest_t=0 oldest_t=0 newest_p='' oldest_p='' mt sz pth
+            while IFS=$'\t' read -r mt sz pth; do
+                [ -n "$pth" ] || continue
+                count=$((count + 1)); bytes=$((bytes + ${sz:-0}))
+                if [ "$mt" -gt "$newest_t" ]; then newest_t=$mt; newest_p=$pth; fi
+                if [ "$oldest_t" -eq 0 ] || [ "$mt" -lt "$oldest_t" ]; then oldest_t=$mt; oldest_p=$pth; fi
+            done < <(list_saves_with_stat "$CFG_ARCHIVE_PATH")
+
+            printf '\n'
+            info "  Saves kept : $count"
+            info "  Using      : $(fmt_size "$bytes")"
+
+            local free; free=$(drive_free_bytes "$CFG_ARCHIVE_PATH")
+            if [ -n "$free" ]; then
+                if [ "$free" -lt $((CFG_MIN_FREE_GB * 1024 * 1024 * 1024)) ]; then
+                    bad  "  Free space : $(fmt_size "$free")   (below your ${CFG_MIN_FREE_GB} GB floor)"
+                else
+                    info "  Free space : $(fmt_size "$free")"
+                fi
+            fi
+
+            if [ "$count" -gt 0 ]; then
+                printf '\n'
+                dim "  Newest : $(epoch_fmt "$newest_t" '%Y-%m-%d %H:%M:%S')  $(basename -- "$newest_p")"
+                dim "  Oldest : $(epoch_fmt "$oldest_t" '%Y-%m-%d %H:%M:%S')  $(basename -- "$oldest_p")"
+                local span=$((newest_t - oldest_t))
+                good "  You can go back $((span / 86400)) day(s) / $((span / 3600)) hour(s)."
+            fi
+        else
+            printf '\n'
+            warn "  The vault folder does not exist yet: $CFG_ARCHIVE_PATH"
+        fi
+
+        local log="$CFG_ARCHIVE_PATH/_log.txt"
+        if [ -f "$log" ]; then
+            printf '\n'
+            info "  Recent activity:"
+            local line
+            while IFS= read -r line; do dim "    $line"; done < <(tail -n 8 "$log" 2>/dev/null)
+        fi
+    fi
+
+    [ "$self_test" = true ] && run_self_test
+
+    printf '\n'
+    if [ "$self_test" != true ]; then
+        dim "  Tip: run '$APP_SLUG status --self-test' to verify the whole pipeline works."
+        printf '\n'
+    fi
+    return 0
+}
+
+# ================================================================ SELF-TEST ==
+#
+# Proves both halves of the job on throwaway files: that saves get captured, and that
+# restoring puts the right one back. It never touches real saves.
+
+ST_PASS=0
+ST_FAIL=0
+
+st_check() {
+    local name=$1; shift
+    if "$@"; then
+        printf '   %sPASS%s  %s\n' "$C_GREEN" "$C_RESET" "$name"
+        ST_PASS=$((ST_PASS + 1))
+    else
+        printf '   %sFAIL%s  %s\n' "$C_RED" "$C_RESET" "$name"
+        ST_FAIL=$((ST_FAIL + 1))
+    fi
+}
+
+st_count_saves() { list_saves_with_stat "$1" | wc -l | tr -d ' '; }
+
+st_same_hash() { [ "$(sha256_of "$1")" = "$2" ]; }
+
+# Ask about the permission bits rather than using [ -w ]: root can write to a 0444 file
+# regardless, so [ -w ] would quietly pass this test without the flag ever being set.
+st_no_write_bits() { local m; m=$(stat_mode "$1") || return 1; [ -n "$m" ] && [ $(( 8#$m & 0222 )) -eq 0 ]; }
+st_owner_can_write() { local m; m=$(stat_mode "$1") || return 1; [ -n "$m" ] && [ $(( 8#$m & 0200 )) -ne 0 ]; }
+
+run_self_test() {
+    printf '\n'
+    printf '%s  ------------------------------------------------------------%s\n' "$C_CYAN" "$C_RESET"
+    info   '   SELF-TEST - uses throwaway files, never your real saves'
+    printf '%s  ------------------------------------------------------------%s\n' "$C_CYAN" "$C_RESET"
+
+    local tmp; tmp=$(mktemp -d "${TMPDIR:-/tmp}/sv-selftest-XXXXXXXX") || { bad "  Could not create a temporary folder."; return 1; }
+    local src="$tmp/src" dst="$tmp/dst"
+    mkdir -p "$src" "$dst"
+    ST_PASS=0; ST_FAIL=0
+
+    local fake="$src/TestProfile_0.sav"
+    head -c 2048 /dev/zero > "$fake"
+    local base_time; base_time=$(stat_mtime "$fake")
+
+    "$SELF" watch --once --quiet --vault "$dst" --source "$src" >/dev/null 2>&1
+
+    local -a stored=()
+    local mt sz p
+    while IFS=$'\t' read -r mt sz p; do stored+=("$p"); done < <(list_saves_with_stat "$dst")
+    local first_name=${stored[0]:-/nonexistent}
+    st_check 'a new save is captured' [ "${#stored[@]}" -eq 1 ]
+    st_check 'stored copy is the right size' [ "$(stat_size "$first_name")" = 2048 ]
+    st_check 'stored copy is protected from overwrite' st_no_write_bits "$first_name"
+
+    local first_hash; first_hash=$(sha256_of "$first_name")
+
+    # A changed save must produce a second copy, leaving the first alone.
+    head -c 4096 /dev/zero > "$fake"
+    touch -d "@$((base_time + 60))" -- "$fake" 2>/dev/null || touch -- "$fake"
+    "$SELF" watch --once --quiet --vault "$dst" --source "$src" >/dev/null 2>&1
+    st_check 'a changed save is captured separately' [ "$(st_count_saves "$dst")" = 2 ]
+    st_check 'the earlier save was left untouched' st_same_hash "$first_name" "$first_hash"
+
+    # Re-saving identical content must not waste space.
+    touch -d "@$((base_time + 120))" -- "$fake" 2>/dev/null || touch -- "$fake"
+    "$SELF" watch --once --quiet --vault "$dst" --source "$src" >/dev/null 2>&1
+    st_check 'identical content is not stored twice' [ "$(st_count_saves "$dst")" = 2 ]
+
+    # ---- getting a save back ----
+    # Restoring matters as much as keeping, so prove that half works too.
+    #
+    # Order matters here. A same-slot restore drops a copy into _before-restore, which
+    # then appears in the listing too and shifts what "--index 2" refers to. So do the
+    # different-slot restore first, while the vault still holds exactly two entries.
+    local older older_hash live_before
+    older=$(list_saves_with_stat "$dst" | sort -rn -k1,1 | sed -n '2p' | cut -f3-)
+    older_hash=$(sha256_of "$older")
+    live_before=$(sha256_of "$fake")
+
+    "$SELF" restore --vault "$dst" --save-path "$src" --index 2 --to-slot 3 --yes >/dev/null 2>&1
+    local slot3="$src/TestProfile_3.sav"
+    st_check 'a save can be restored into a different slot' st_same_hash "$slot3" "$older_hash"
+    st_check 'restoring elsewhere leaves the original slot alone' st_same_hash "$fake" "$live_before"
+
+    # ---- restoring into its own slot ----
+    "$SELF" restore --vault "$dst" --save-path "$src" --index 2 --yes >/dev/null 2>&1
+    st_check 'a chosen save is put back into the game folder' st_same_hash "$fake" "$older_hash"
+    st_check 'the restored save is not left read-only' st_owner_can_write "$fake"
+
+    # A read-only restored save would stop the game writing that slot at all.
+    local can_write=false
+    if ( exec 3>>"$fake" ) 2>/dev/null; then can_write=true; fi
+    st_check 'the game can still write to the restored save' [ "$can_write" = true ]
+
+    local kept; kept=$(find "$dst/_before-restore" -type f -name '*.sav' 2>/dev/null | head -n 1)
+    st_check 'the save being replaced was kept first' st_same_hash "${kept:-/nonexistent}" "$live_before"
+    st_check 'restoring destroyed nothing in the vault' st_same_hash "$older" "$older_hash"
+
+    # ---- two monitors must never share one vault ----
+    # Both would race on the same temporary file and could commit a mixed-content save
+    # that still passed its length check.
+    local src2="$tmp/src2" dst2="$tmp/dst2"
+    mkdir -p "$src2" "$dst2"
+    head -c 512 /dev/zero > "$src2/TestProfile_0.sav"
+    "$SELF" watch --quiet --vault "$dst2" --source "$src2" >/dev/null 2>&1 &
+    local bg=$!
+    local waited=0
+    while [ ! -e "$dst2/_lock" ] && [ ! -d "$dst2/_lock.d" ] && [ "$waited" -lt 100 ]; do
+        sleep 0.1 2>/dev/null || sleep 1
+        waited=$((waited + 1))
+    done
+    sleep 0.5 2>/dev/null || sleep 1
+    local second_rc=0
+    "$SELF" watch --once --quiet --vault "$dst2" --source "$src2" >/dev/null 2>&1 || second_rc=$?
+    kill "$bg" 2>/dev/null
+    wait "$bg" 2>/dev/null
+    st_check 'a second monitor refuses to share one vault' [ "$second_rc" -eq 2 ]
+
+    # ---- a name already in the vault is never written over ----
+    local src3="$tmp/src3" dst3="$tmp/dst3"
+    mkdir -p "$src3" "$dst3"
+    local f3="$src3/TestProfile_9.sav"
+    head -c 1024 /dev/zero > "$f3"
+    local m3 day3 stamp3
+    m3=$(stat_mtime "$f3")
+    day3=$(epoch_fmt "$m3" '%Y-%m-%d')
+    stamp3=$(epoch_fmt "$m3" '%Y-%m-%d_%H-%M-%S')
+    mkdir -p "$dst3/$day3"
+    local decoy="$dst3/$day3/TestProfile_9__$stamp3.sav"
+    printf 'not a real save' > "$decoy"
+    local decoy_hash; decoy_hash=$(sha256_of "$decoy")
+    "$SELF" watch --once --quiet --vault "$dst3" --source "$src3" >/dev/null 2>&1
+    st_check 'an existing vault file is never overwritten' st_same_hash "$decoy" "$decoy_hash"
+    st_check 'the save is stored alongside it instead' [ "$(stat_size "$dst3/$day3/TestProfile_9__${stamp3}_2.sav" 2>/dev/null)" = 1024 ]
+
+    rm -rf -- "$tmp" 2>/dev/null
+
+    printf '\n'
+    if [ "$ST_FAIL" -eq 0 ]; then
+        good "   $ST_PASS checks passed. The vault is working correctly."
+    else
+        bad  "   $ST_PASS passed, $ST_FAIL FAILED. Please report this."
+        return 1
+    fi
+    return 0
+}
+
+# ============================================================ AUTOSTART ======
+
+have_systemd_user() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl --user show-environment >/dev/null 2>&1
+}
+
+write_service_unit() {
+    mkdir -p -- "$SYSTEMD_USER_DIR" || return 1
+    cat > "$SERVICE_PATH" <<UNIT
+[Unit]
+Description=$APP_NAME - keeps a timestamped copy of every game save
+Documentation=https://github.com/bizzyjb/caretaker-seedvault
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=$INSTALLED_BIN watch --quiet
+# If the monitor ever dies, saves stop being protected - so bring it straight back.
+Restart=always
+RestartSec=15
+# Exit code 2 means another monitor already has this vault. Restarting would just
+# spin, and there is nothing wrong: the saves are already being looked after.
+RestartPreventExitStatus=2
+# Stay out of the way of the game.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target
+UNIT
+}
+
+write_autostart_desktop() {
+    mkdir -p -- "$(dirname -- "$AUTOSTART_PATH")" || return 1
+    cat > "$AUTOSTART_PATH" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=$APP_NAME
+Comment=Keeps a timestamped copy of every game save
+Exec=$INSTALLED_BIN watch --quiet
+Terminal=false
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+DESKTOP
+}
+
+write_desktop_entries() {
+    mkdir -p -- "$DESKTOP_DIR" || return 1
+    cat > "$DESKTOP_DIR/$APP_SLUG-restore.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=$APP_NAME - Restore a Save
+Comment=Put an older save back into the game
+Exec=$INSTALLED_BIN restore
+Terminal=true
+Categories=Game;Utility;
+DESKTOP
+    cat > "$DESKTOP_DIR/$APP_SLUG-status.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=$APP_NAME - Status
+Comment=Check that your saves are being preserved
+Exec=$INSTALLED_BIN status
+Terminal=true
+Categories=Game;Utility;
+DESKTOP
+}
+
+# Ask every monitor to stop, then wait until they actually have. Reporting "stopped"
+# while a monitor is still holding the vault lock would make the very next start fail
+# for no visible reason.
+stop_monitors_and_wait() {
+    local pid waited=0 any=false
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        kill "$pid" 2>/dev/null && any=true
+    done < <(monitor_pids)
+    [ "$any" = false ] && return 0
+
+    while [ -n "$(monitor_pids)" ] && [ "$waited" -lt 60 ]; do
+        sleep 0.25 2>/dev/null || sleep 1
+        waited=$((waited + 1))
+    done
+    # Still there after fifteen seconds means it is wedged, so insist.
+    while IFS= read -r pid; do
+        [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
+    done < <(monitor_pids)
+    return 0
+}
+
+start_monitor_detached() {
+    # No systemd: run it detached from this terminal, so closing the window does not
+    # take the monitor down with it.
+    nohup "$INSTALLED_BIN" watch --quiet >/dev/null 2>&1 &
+    disown 2>/dev/null
+    return 0
+}
+
+# =================================================================== SETUP ==
+
+ask() {
+    local prompt=$1 default=${2:-} answer=''
+    if [ -n "$default" ]; then
+        read -r -p "  $prompt [$default]: " answer
+    else
+        read -r -p "  $prompt: " answer
+    fi
+    printf '%s' "${answer:-$default}"
+}
+
+# Mount points with room to spare, so the vault can be offered somewhere that survives
+# the disk holding the saves failing. Only real block devices - tmpfs and the like are
+# not somewhere to keep the one copy of your progress.
+vault_suggestions() {
+    local save_device=$1
+    local dev avail mount
+    df -Pk 2>/dev/null | tail -n +2 | while read -r dev _ _ avail _ mount; do
+        case "$dev" in /dev/*) ;; *) continue ;; esac
+        [ -n "$mount" ] || continue
+        [ "$mount" = / ] && continue
+        [ "$dev" = "$save_device" ] && continue
+        [ "$((avail * 1024))" -ge $((20 * 1024 * 1024 * 1024)) ] || continue
+        [ -w "$mount" ] || continue
+        case "$mount" in
+            /boot*|/efi*|/var*|/usr*|/nix*|/snap*) continue ;;
+        esac
+        printf '%s/CaretakerSeedVault\n' "${mount%/}"
+    done | awk 'NF && !seen[$0]++' | head -n 4
+}
+
+cmd_setup() {
+    local non_interactive=false save_path='' vault_path='' skip_service=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --non-interactive|-n) non_interactive=true ;;
+            --save-path)  shift; save_path=$(clean_path "${1:-}") ;;
+            --vault-path) shift; vault_path=$(clean_path "${1:-}") ;;
+            --no-service) skip_service=true ;;
+            -h|--help) say "Usage: $APP_SLUG setup [--save-path DIR] [--vault-path DIR] [--non-interactive]"; return 0 ;;
+            *) die "setup: unknown option '$1'" ;;
+        esac
+        shift
+    done
+    if [ "$non_interactive" != true ] && [ ! -t 0 ]; then
+        die "Setup needs a terminal to ask you two questions. Run it directly, or pass --non-interactive."
+    fi
+
+    banner 'Setup'
+    dim "  This keeps a copy of every save your game writes, each one stamped with the"
+    dim "  time it was made. Nothing in the vault is ever overwritten or deleted, so you"
+    dim "  can always go back to any point - not just the last few minutes."
+    printf '\n'
+
+    # --------------------------------------------------- 1. find the saves ----
+    info "  [1/4] Looking for your saves..."
+    printf '\n'
+
+    local -a sources=()
+    local chosen_save='' chosen_backup=''
+
+    if [ -n "$save_path" ]; then
+        local line; line=$(resolve_manual_save_path "$save_path") || die "The save path given is not usable: $save_path"
+        chosen_save=$(printf '%s' "$line" | cut -f1)
+        sources=("${RESOLVED_SOURCES[@]}")
+    else
+        local -a cand_profile=() cand_save=() cand_bak=() cand_count=() cand_bytes=() cand_newest=()
+        local pr sv bk ct by nw
+        while IFS=$'\t' read -r pr sv bk ct by nw; do
+            [ -n "$sv" ] || continue
+            cand_profile+=("$pr"); cand_save+=("$sv"); cand_bak+=("$bk")
+            cand_count+=("$ct");   cand_bytes+=("$by"); cand_newest+=("$nw")
+        done < <(find_caretaker_saves false)
+
+        # Nothing in the usual places - offer to go looking properly before giving up.
+        if [ ${#cand_save[@]} -eq 0 ] && [ "$non_interactive" != true ]; then
+            warn "  Not in any of the usual places."
+            local deep; deep=$(ask "Search your home folder for them? (Y/n)" Y)
+            case "$deep" in
+                [Nn]*) ;;
+                *)
+                    dim "  Searching..."
+                    while IFS=$'\t' read -r pr sv bk ct by nw; do
+                        [ -n "$sv" ] || continue
+                        cand_profile+=("$pr"); cand_save+=("$sv"); cand_bak+=("$bk")
+                        cand_count+=("$ct");   cand_bytes+=("$by"); cand_newest+=("$nw")
+                    done < <(find_caretaker_saves true)
+                    ;;
+            esac
+        fi
+
+        local n=${#cand_save[@]}
+        if [ "$n" -gt 0 ]; then
+            good "  Found The Last Caretaker saves:"
+            printf '\n'
+            local i
+            for (( i = 0; i < n; i++ )); do
+                say  "    $((i + 1))) profile ${cand_profile[$i]}"
+                dim  "       ${cand_count[$i]} save(s), $(fmt_size "${cand_bytes[$i]}"), last played $(epoch_fmt "${cand_newest[$i]}" '%Y-%m-%d %H:%M')"
+                dim  "       ${cand_save[$i]}"
+                [ -n "${cand_bak[$i]}" ] && dim "       + the game's own backup folder (will also be watched)"
+            done
+            printf '\n'
+            dim "    (The folder is called 'Voyage' - that's the game's internal codename,"
+            dim "     not a different game.)"
+            printf '\n'
+
+            local pick=1
+            if [ "$non_interactive" != true ]; then
+                if [ "$n" -eq 1 ]; then
+                    local ok; ok=$(ask "Use this one? (Y/n, or 'm' to type a path yourself)" Y)
+                    case "$ok" in [Mm]*|[Nn]*) pick=0 ;; esac
+                else
+                    local answer; answer=$(ask "Which one? (1-$n, or 'm' to type a path yourself)" 1)
+                    if [[ $answer =~ ^[0-9]+$ ]] && [ "$answer" -ge 1 ] && [ "$answer" -le "$n" ]; then
+                        pick=$answer
+                    else
+                        pick=0
+                    fi
+                fi
+            fi
+            if [ "$pick" -gt 0 ]; then
+                local k=$((pick - 1))
+                chosen_save=${cand_save[$k]}
+                chosen_backup=${cand_bak[$k]}
+                sources=("$chosen_save")
+                [ -n "$chosen_backup" ] && sources+=("$chosen_backup")
+            fi
+        else
+            warn "  Could not find the game's saves automatically."
+            dim  "  Under Proton they are usually here:"
+            dim  "    $EXAMPLE_SAVE_PATH"
+            printf '\n'
+        fi
+
+        while [ ${#sources[@]} -eq 0 ]; do
+            [ "$non_interactive" = true ] && die "Could not find your saves. Re-run with --save-path DIR."
+            dim "  Paste the full path to the folder containing your .sav files."
+            dim "  (Blank to cancel.)"
+            local manual; read -r -p "  Path: " manual
+            [ -n "${manual:-}" ] || { say "  Setup cancelled."; return 0; }
+            local line
+            if line=$(resolve_manual_save_path "$manual"); then
+                chosen_save=$(printf '%s' "$line" | cut -f1)
+                sources=("${RESOLVED_SOURCES[@]}")
+            fi
+        done
+    fi
+
+    printf '\n'
+    good "  Watching: $chosen_save"
+    local s
+    for s in "${sources[@]}"; do
+        [ "$s" != "$chosen_save" ] && good "           + $s"
+    done
+
+    # ------------------------------------------------- 2. where the vault ----
+    printf '\n'
+    info "  [2/4] Where should the vault live?"
+    printf '\n'
+
+    local save_device; save_device=$(path_device "$chosen_save")
+    if [ -z "$vault_path" ]; then
+        local -a suggestions=()
+        while IFS= read -r s; do [ -n "$s" ] && suggestions+=("$s"); done < <(vault_suggestions "$save_device")
+        suggestions+=("$HOME/CaretakerSeedVault")
+
+        local i free note extra
+        for (( i = 0; i < ${#suggestions[@]}; i++ )); do
+            free=$(drive_free_bytes "${suggestions[$i]}")
+            note=''; [ -n "$free" ] && note="($(fmt_size "$free") free)"
+            extra=''
+            [ "$(path_device "${suggestions[$i]}")" != "$save_device" ] && extra='  - different drive from your saves, safer'
+            say "    $((i + 1))) ${suggestions[$i]}  $note$extra"
+        done
+        say "    $(( ${#suggestions[@]} + 1 ))) somewhere else - I'll type it"
+        printf '\n'
+        dim "  Saves can be large. Expect a few hundred MB per long session."
+        printf '\n'
+
+        if [ "$non_interactive" = true ]; then
+            vault_path=${suggestions[0]}
+        else
+            local answer; answer=$(ask "Choose (1-$(( ${#suggestions[@]} + 1 )))" 1)
+            if [[ $answer =~ ^[0-9]+$ ]] && [ "$answer" -ge 1 ] && [ "$answer" -le "${#suggestions[@]}" ]; then
+                vault_path=${suggestions[$((answer - 1))]}
+            else
+                while [ -z "$vault_path" ]; do
+                    local typed; read -r -p "  Full path for the vault folder: " typed
+                    [ -n "${typed:-}" ] || { say "  Setup cancelled."; return 0; }
+                    vault_path=$(clean_path "$typed")
+                done
+            fi
+        fi
+    fi
+
+    # Warn about choices that cause real problems, but let the user decide.
+    local cloud; if cloud=$(is_cloud_synced_path "$vault_path"); then
+        printf '\n'
+        warn "  Warning: that folder looks like it syncs to $cloud."
+        warn "  Large saves landing there every few minutes will cause constant uploads."
+        if [ "$non_interactive" != true ]; then
+            local go; go=$(ask "Use it anyway? (y/N)" N)
+            case "$go" in [Yy]*) ;; *) say "  Setup cancelled - run again and pick another folder."; return 0 ;; esac
+        fi
+    fi
+
+    mkdir -p -- "$vault_path" || die "Could not create $vault_path"
+    if [ "$(path_device "$vault_path")" = "$save_device" ]; then
+        printf '\n'
+        warn "  Note: the vault is on the same drive as your saves. That fully protects"
+        warn "  against the game overwriting them, but not against the drive failing."
+    fi
+    printf '\n'
+    good "  Vault: $vault_path"
+
+    # --------------------------------------------- 3. install + snapshot ----
+    printf '\n'
+    info "  [3/4] Installing and taking a first snapshot..."
+
+    mkdir -p -- "$INSTALL_ROOT" || die "Could not create $INSTALL_ROOT"
+    if [ "$SELF" != "$INSTALLED_BIN" ]; then
+        cp -f -- "$SELF" "$INSTALLED_BIN" || die "Could not install to $INSTALLED_BIN"
+    fi
+    chmod 0755 -- "$INSTALLED_BIN" 2>/dev/null
+    dim "  Installed to $INSTALLED_BIN"
+
+    # A command on PATH, so this is usable from any terminal.
+    local bindir="$HOME/.local/bin"
+    mkdir -p -- "$bindir" 2>/dev/null
+    if ln -sf -- "$INSTALLED_BIN" "$bindir/$APP_SLUG" 2>/dev/null; then
+        case ":${PATH}:" in
+            *":$bindir:"*) dim "  Command available as: $APP_SLUG" ;;
+            *)             dim "  Command installed at $bindir/$APP_SLUG (not on your PATH yet)." ;;
+        esac
+    fi
+
+    CFG_SOURCE_PATHS=("${sources[@]}")
+    CFG_ARCHIVE_PATH=$vault_path
+    write_config
+
+    # Capture what exists right now, before the game recycles any of it. The game's own
+    # backup folder holds states that exist nowhere else and are deleted on a rolling
+    # basis.
+    #
+    # Only on a genuinely new vault, though. Re-running setup is the documented way to
+    # upgrade, and a vault that already has a manifest has been watched all along -
+    # another snapshot would just duplicate hundreds of MB that are already stored, on
+    # every single upgrade, in a tool that deliberately never deletes anything.
+    if [ -f "$vault_path/_manifest.csv" ]; then
+        good "  Existing vault found - keeping its history, no new snapshot needed."
+    else
+        local stamp; stamp=$(date '+%Y-%m-%d_%H-%M-%S')
+        local snap_dir="$vault_path/_snapshot_$stamp" snapped=0 sp leaf dest f
+        for sp in "${sources[@]}"; do
+            [ -d "$sp" ] || continue
+            leaf=$(basename -- "$(dirname -- "$sp")")   # SaveGames | SaveGameBackups
+            dest="$snap_dir/$leaf"
+            mkdir -p -- "$dest" || continue
+            for f in "$sp"/*.sav; do
+                [ -f "$f" ] || continue
+                cp -p -- "$f" "$dest/$(basename -- "$f")" 2>/dev/null && snapped=$((snapped + 1))
+            done
+        done
+        good "  Snapshot: $snapped save file(s) secured in $(basename -- "$snap_dir")"
+    fi
+
+    # -------------------------------------------------- 4. run at login ----
+    printf '\n'
+    info "  [4/4] Setting it to run automatically..."
+
+    local auto_method='NOT set to start automatically'
+    if [ "$skip_service" = true ]; then
+        auto_method='disabled (--no-service)'
+        dim "  Skipped, as asked."
+    elif have_systemd_user; then
+        if write_service_unit; then
+            systemctl --user daemon-reload >/dev/null 2>&1
+            # An old monitor must be stopped so the upgrade actually takes effect - but
+            # as late as possible, immediately before the replacement starts. Killing it
+            # earlier would mean any failure above leaves you with no monitor at all,
+            # which is the one state this tool must never put you in.
+            stop_monitors_and_wait
+            if systemctl --user enable --now "$SERVICE_NAME" >/dev/null 2>&1; then
+                systemctl --user restart "$SERVICE_NAME" >/dev/null 2>&1
+                auto_method='systemd user service'
+                good "  Enabled the systemd user service."
+            else
+                warn "  Could not enable the systemd service - falling back to desktop autostart."
+                write_autostart_desktop && auto_method='desktop autostart'
+                start_monitor_detached
+            fi
+        fi
+    else
+        dim "  No systemd user session here - using desktop autostart instead."
+        stop_monitors_and_wait
+        if write_autostart_desktop; then
+            auto_method='desktop autostart'
+            good "  Added to your desktop autostart."
+        else
+            warn "  Could not write the autostart entry."
+        fi
+        start_monitor_detached
+    fi
+
+    write_desktop_entries 2>/dev/null
+
+    # Whatever happened above, confirm a monitor is actually running. Setup reporting
+    # success while nothing is watching would be the worst possible outcome.
+    if [ "$skip_service" != true ]; then
+        sleep 3
+        if [ -n "$(monitor_pids)" ]; then
+            good "  Monitor is running."
+        else
+            printf '\n'
+            bad  "  WARNING: the monitor did not start. Your saves are NOT being copied."
+            warn "  Try starting it by hand and see what it says:"
+            warn "    $INSTALLED_BIN watch"
+        fi
+    fi
+
+    # ------------------------------------------------------------ summary ----
+    # Steam Cloud can quietly undo a restore, which is the one thing that would make
+    # this whole tool look broken. Say so while the user is still here, not in a README
+    # they will read after it has already happened.
+    steam_cloud_hint "${sources[@]}"
+    [ "$CLOUD_PRESENT" = true ] && show_steam_cloud_advice false
+
+    printf '\n'
+    printf '%s  ------------------------------------------------------------%s\n' "$C_CYAN" "$C_RESET"
+    good   '   All set. Your saves are being preserved.'
+    printf '%s  ------------------------------------------------------------%s\n' "$C_CYAN" "$C_RESET"
+    printf '\n'
+    say "   Vault      : $vault_path"
+    say "   Watching   : ${#sources[@]} folder(s)"
+    say "   Starts via : $auto_method (automatically, at every login)"
+    say "   Log        : $vault_path/_log.txt"
+    printf '\n'
+    info "   To get a save back later:   $APP_SLUG restore"
+    info "   To check on it:             $APP_SLUG status"
+    if [ "$CLOUD_PRESENT" = true ] && [ "$CLOUD_VERDICT" != likely-off ]; then
+        printf '\n'
+        warn "   Don't forget the Steam Cloud step above - it matters when restoring."
+    fi
+    printf '\n'
+    dim "   Play normally. You don't need to do anything else."
+    printf '\n'
+    return 0
+}
+
+# =============================================================== UNINSTALL ==
+
+cmd_uninstall() {
+    local assume_yes=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes|-y) assume_yes=true ;;
+            -h|--help) say "Usage: $APP_SLUG uninstall [--yes]"; return 0 ;;
+            *) die "uninstall: unknown option '$1'" ;;
+        esac
+        shift
+    done
+
+    banner 'Uninstall'
+    read_config || true
+
+    if [ "$CFG_LOADED" = true ] && [ -d "$CFG_ARCHIVE_PATH" ]; then
+        local count=0 bytes=0 mt sz p
+        while IFS=$'\t' read -r mt sz p; do
+            [ -n "$p" ] || continue
+            count=$((count + 1)); bytes=$((bytes + ${sz:-0}))
+        done < <(list_saves_with_stat "$CFG_ARCHIVE_PATH")
+        info "  Your vault holds $count save(s), $(fmt_size "$bytes")."
+        info "    $CFG_ARCHIVE_PATH"
+        printf '\n'
+        good "  This will NOT be deleted. Uninstalling only stops new saves being kept."
+        dim  "  Delete that folder yourself if and when you want the space back."
+        printf '\n'
+    fi
+
+    if [ "$assume_yes" != true ]; then
+        local go; read -r -p "  Type YES to stop and remove $APP_NAME: " go
+        [ "$go" = YES ] || { say '  Cancelled - nothing was changed.'; return 0; }
+    fi
+
+    if have_systemd_user && [ -f "$SERVICE_PATH" ]; then
+        systemctl --user disable --now "$SERVICE_NAME" >/dev/null 2>&1
+        rm -f -- "$SERVICE_PATH"
+        systemctl --user daemon-reload >/dev/null 2>&1
+        good "  Removed the systemd user service."
+    elif [ -f "$SERVICE_PATH" ]; then
+        rm -f -- "$SERVICE_PATH"
+        good "  Removed the systemd unit file."
+    fi
+
+    if [ -f "$AUTOSTART_PATH" ]; then
+        rm -f -- "$AUTOSTART_PATH"
+        good "  Removed it from desktop autostart."
+    fi
+
+    local -a running=()
+    local pid
+    while IFS= read -r pid; do [ -n "$pid" ] && running+=("$pid"); done < <(monitor_pids)
+    if [ ${#running[@]} -gt 0 ]; then
+        stop_monitors_and_wait
+        if [ -z "$(monitor_pids)" ]; then
+            good "  Stopped the running monitor (PID ${running[*]})."
+        else
+            warn "  A monitor process is still running; it will stop shortly."
+        fi
+    fi
+
+    # Every step below is best-effort. Stopping the monitor is the part that matters; a
+    # leftover shortcut must never abort the uninstall and leave things half-removed.
+    local -a leftovers=()
+    rm -f -- "$DESKTOP_DIR/$APP_SLUG-restore.desktop" "$DESKTOP_DIR/$APP_SLUG-status.desktop" 2>/dev/null
+    [ -L "$HOME/.local/bin/$APP_SLUG" ] && rm -f -- "$HOME/.local/bin/$APP_SLUG" 2>/dev/null
+
+    # Deleting the script that is currently executing is fine on Linux: the running
+    # process keeps its own copy of the file open until it exits.
+    rm -rf -- "$INSTALL_ROOT" 2>/dev/null || leftovers+=("$INSTALL_ROOT")
+    rm -rf -- "$CONFIG_DIR"   2>/dev/null || leftovers+=("$CONFIG_DIR")
+
+    if [ ${#leftovers[@]} -gt 0 ]; then
+        printf '\n'
+        warn "  The monitor is stopped and will not start again, but these could not be"
+        warn "  deleted automatically. Delete them by hand if you want them gone:"
+        local l; for l in "${leftovers[@]}"; do warn "    $l"; done
+    fi
+
+    printf '\n'
+    good "  $APP_NAME has been removed."
+    if [ "$CFG_LOADED" = true ]; then
+        info "  Your saved games are still safe in:"
+        info "    $CFG_ARCHIVE_PATH"
+    fi
+    printf '\n'
+    return 0
+}
+
+# ============================================================ SMALL VERBS ==
+
+cmd_start() {
+    read_config || die "Not set up on this machine yet. Run:  $APP_SLUG setup"
+    if have_systemd_user && [ -f "$SERVICE_PATH" ]; then
+        systemctl --user start "$SERVICE_NAME" || die "systemctl could not start $SERVICE_NAME"
+    else
+        [ -n "$(monitor_pids)" ] || start_monitor_detached
+    fi
+    sleep 2
+    if [ -n "$(monitor_pids)" ]; then good "  Monitor is running."; else bad "  Monitor did not start."; return 1; fi
+}
+
+cmd_stop() {
+    if have_systemd_user && [ -f "$SERVICE_PATH" ]; then
+        systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1
+    fi
+    stop_monitors_and_wait
+    if [ -z "$(monitor_pids)" ]; then good "  Monitor stopped. Your saves are no longer being copied."; else warn "  Some monitor processes are still running."; fi
+}
+
+cmd_restart() { cmd_stop >/dev/null 2>&1; cmd_start; }
+
+cmd_log() {
+    read_config || die "Not set up on this machine yet. Run:  $APP_SLUG setup"
+    local log="$CFG_ARCHIVE_PATH/_log.txt"
+    [ -f "$log" ] || die "No log yet at $log"
+    if [ "${1:-}" = "--follow" ] || [ "${1:-}" = "-f" ]; then tail -f "$log"; else tail -n "${1:-40}" "$log"; fi
+}
+
+cmd_help() {
+    banner
+    say "  Usage: $APP_SLUG <command> [options]"
+    printf '\n'
+    say "    setup            Find your saves, pick a vault, start protecting them"
+    say "    status           Is it running? What has it kept? How far back can you go?"
+    say "    status --self-test   Prove the whole pipeline works, on throwaway files"
+    say "    restore          Put an older save back into the game"
+    say "    start | stop | restart    Control the monitor"
+    say "    log [N] | log -f Show the vault's activity log"
+    say "    uninstall        Stop it and remove it (your vault is never deleted)"
+    say "    version          Print the version"
+    printf '\n'
+    dim  "  Restore options:  --index N   --to-slot N|auto   --slot NAME   --last N   --yes"
+    dim  "  Setup options:    --save-path DIR   --vault-path DIR   --non-interactive"
+    printf '\n'
+    dim  "  Config: $CONFIG_PATH"
+    printf '\n'
+}
+
+# ==================================================================== MAIN ==
+
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null) || SELF=${BASH_SOURCE[0]}
+[ -n "$SELF" ] || SELF=${BASH_SOURCE[0]}
+
+main() {
+    local cmd=${1:-help}
+    [ $# -gt 0 ] && shift
+    case "$cmd" in
+        setup|install)          cmd_setup "$@" ;;
+        watch|monitor)          cmd_watch "$@" ;;
+        status)                 cmd_status "$@" ;;
+        selftest|self-test)     cmd_status --self-test "$@" ;;
+        restore)                cmd_restore "$@" ;;
+        uninstall|remove)       cmd_uninstall "$@" ;;
+        start)                  cmd_start "$@" ;;
+        stop)                   cmd_stop "$@" ;;
+        restart)                cmd_restart "$@" ;;
+        log|logs)               cmd_log "$@" ;;
+        version|--version|-v)   say "$APP_NAME v$APP_VERSION (Linux edition)" ;;
+        help|--help|-h)         cmd_help ;;
+        *)                      bad "  Unknown command: $cmd"; printf '\n'; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"

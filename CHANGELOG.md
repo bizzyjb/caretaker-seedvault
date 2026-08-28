@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.2.0
+
+- **There is now a Linux edition**, in `linux/`, at feature parity with the Windows one.
+  It is a single self-contained Bash script needing only bash 4+ and coreutils — no
+  Python, no interpreter version to match, no packages, no root. It works on Bazzite and
+  the Steam Deck, where everything it installs stays under `$HOME` so the immutable root
+  filesystem is never in the way.
+- It finds saves inside the Proton prefix rather than assuming a path: the normal Steam
+  layout, Flatpak Steam, the Debian and Snap packages, every extra library listed in
+  `libraryfolders.vdf` (so a second drive or a Deck SD card is covered), and Wine, Lutris,
+  Heroic and Bottles prefixes. The Steam AppID is not pinned, so detection survives it
+  changing. Failing all that it offers to search your home folder, or you can paste a path.
+- Autostart is a systemd *user* service, which is what makes it run in Steam Deck Game
+  Mode rather than only in Desktop Mode, and `Restart=always` replaces the Windows
+  scheduled-task self-heal.
+- Two guarantees had to be rebuilt rather than ported. Windows can ask the filesystem to
+  refuse a read while a file is being written; Linux has no mandatory locking, so instead
+  the kernel is asked through `/proc/<pid>/fdinfo` whether the game still holds the save
+  open *for writing* — access mode, not mere openness, since a save held read-only would
+  otherwise look busy forever. And the never-overwrite rule is enforced by hard-linking
+  the copy into place, which fails outright on a taken name where `mv` would clobber.
+- Self-test covers 16 checks there, three more than the Windows edition: that an existing
+  vault file is never written over, that the save is stored alongside it instead, and that
+  a second monitor refuses to share a vault.
+- The Windows edition is unchanged in this release apart from the version number, so both
+  editions report the same version.
+
 ## 1.1.2
 
 - **The Steam Cloud warning now checks whether you have already dealt with it.** Steam keeps

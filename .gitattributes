@@ -1,2 +1,6 @@
 * text=auto eol=crlf
 *.md text eol=lf
+
+# The Linux edition must keep LF endings and its executable bit: a shebang followed by
+# a CR is not a valid interpreter path, so a CRLF checkout would ship a broken script.
+linux/caretaker-seedvault text eol=lf
