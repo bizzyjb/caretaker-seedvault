@@ -80,8 +80,24 @@ restore then looks like it silently failed, which is a miserable thing to debug.
 complete history. The only thing it stops is Steam syncing *this game's* saves between
 computers — every other game is unaffected.
 
-Setup will remind you if it sees that the game uses Steam Cloud. It can't tell whether
-you've already turned it off, though: Steam leaves its marker file in place either way.
+### How it guesses whether you've already done this
+
+Steam leaves its marker file (`steam_autocloud.vdf`) next to your saves even after you
+turn cloud off, so its presence proves nothing on its own. But Steam keeps that file's
+timestamp current while it *is* syncing — so the tool compares it against your newest save:
+
+- **You've saved more recently than Steam touched its marker** → Steam probably isn't
+  syncing this game any more, so it says the setting looks handled and stays quiet.
+- **Otherwise** → it shows the full advice.
+
+Comparing against your save activity rather than the clock matters: if it just looked for
+an "old" file, anyone who hadn't played for a week would be told cloud was off when it
+wasn't.
+
+It's a hint, never a verdict, and it's biased toward nagging you — telling someone
+"you're fine" when they aren't would walk them straight into the bug. Two known cases
+where it errs cautious: right after you change the setting (Steam touches the file, so it
+reads as active until you next play), and on a brand-new install with no save history.
 
 **Symptom to watch for:** you restore an old save, launch the game, and you're back at
 your most recent progress instead. That's Steam Cloud, not a failed restore — your save is

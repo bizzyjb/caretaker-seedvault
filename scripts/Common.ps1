@@ -5,7 +5,7 @@
 
 $script:AppName    = 'Caretaker SeedVault'
 $script:AppSlug    = 'CaretakerSeedVault'
-$script:AppVersion = '1.1.1'
+$script:AppVersion = '1.1.2'
 $script:TaskName   = 'CaretakerSeedVault'
 
 # Culture-invariant formatting. On a machine with a different locale, culture-aware
@@ -234,10 +234,76 @@ function Test-SteamCloudSaves {
 }
 
 <#
+    Guess whether Steam Cloud is still switched on for this game.
+
+    Steam keeps the marker file's timestamp current while it is syncing, so comparing it
+    against the newest save is more telling than the file merely existing. If you have
+    played since Steam last touched its marker, Steam is probably not syncing this game
+    any more.
+
+    Comparing against save activity rather than the clock matters: someone who has not
+    played for a week would look "stale" by wall-clock even with cloud fully enabled.
+
+    This is a hint, never a verdict. Wrongly telling someone cloud is off would send them
+    straight into the bug this warns about, so an inconclusive read always falls back to
+    showing the full advice.
+#>
+function Get-SteamCloudHint {
+    param([string[]]$SourcePaths)
+
+    $marker = $null
+    foreach ($p in @($SourcePaths)) {
+        if (-not $p) { continue }
+        $candidate = Join-Path $p 'steam_autocloud.vdf'
+        if (Test-Path -LiteralPath $candidate) { $marker = Get-Item -LiteralPath $candidate; break }
+    }
+    if (-not $marker) { return [PSCustomObject]@{ Present = $false; Verdict = 'none' } }
+
+    $newest = $null
+    foreach ($p in @($SourcePaths)) {
+        if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
+        $s = Get-ChildItem -LiteralPath $p -Filter '*.sav' -File -ErrorAction SilentlyContinue |
+             Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($s -and (-not $newest -or $s.LastWriteTime -gt $newest.LastWriteTime)) { $newest = $s }
+    }
+
+    # A little slack, so a save written moments before Steam synced isn't read as "off".
+    $verdict = 'unclear'
+    if ($newest) {
+        if ($newest.LastWriteTime -gt $marker.LastWriteTime.AddMinutes(15)) { $verdict = 'likely-off' }
+        else { $verdict = 'likely-on' }
+    }
+
+    [PSCustomObject]@{
+        Present        = $true
+        Verdict        = $verdict
+        MarkerTime     = $marker.LastWriteTime
+        NewestSaveTime = $(if ($newest) { $newest.LastWriteTime } else { $null })
+    }
+}
+
+<#
     Steam Cloud can silently undo a restore, so say so in one place and use it everywhere.
 #>
 function Show-SteamCloudAdvice {
-    param([switch]$Short)
+    param([switch]$Short, $Hint)
+
+    # Softer wording when the evidence suggests it is already dealt with - but never
+    # silence: a wrong "you're fine" would walk the user into the exact bug.
+    if ($Hint -and $Hint.Verdict -eq 'likely-off') {
+        Write-Host ''
+        Write-Host "  Steam Cloud: probably already off for this game." -ForegroundColor Green
+        Write-Host "    Steam last touched its marker file on $($Hint.MarkerTime.ToString('yyyy-MM-dd HH:mm'))," -ForegroundColor Gray
+        Write-Host "    but you have saved since then ($($Hint.NewestSaveTime.ToString('yyyy-MM-dd HH:mm'))), so it does not" -ForegroundColor Gray
+        Write-Host "    look like Steam is syncing this game any more. That is a guess, not a fact." -ForegroundColor Gray
+        if (-not $Short) {
+            Write-Host ''
+            Write-Host "    If you would rather be certain: Steam -> Library -> right-click the game" -ForegroundColor DarkGray
+            Write-Host "    -> Properties -> General -> 'Keep game saves in the Steam Cloud'." -ForegroundColor DarkGray
+        }
+        return
+    }
+
     if ($Short) {
         Write-Host "  Reminder: if Steam Cloud is on for this game, it can replace your restored" -ForegroundColor Yellow
         Write-Host "  save when the game next starts. See the README if a restore seems to undo itself." -ForegroundColor Yellow
@@ -261,8 +327,15 @@ function Show-SteamCloudAdvice {
     Write-Host "  keeps its own full history. It only stops Steam syncing THIS game's saves" -ForegroundColor Gray
     Write-Host "  between computers - every other game is unaffected." -ForegroundColor Gray
     Write-Host ''
-    Write-Host "  (Steam leaves its marker file behind either way, so this tool cannot tell" -ForegroundColor DarkGray
-    Write-Host "   whether you have already turned it off.)" -ForegroundColor DarkGray
+    if ($Hint -and $Hint.MarkerTime) {
+        Write-Host "  (Steam last touched its marker file here on $($Hint.MarkerTime.ToString('yyyy-MM-dd HH:mm')) -" -ForegroundColor DarkGray
+        Write-Host "   recent enough that it may still be syncing. Steam leaves that file behind" -ForegroundColor DarkGray
+        Write-Host "   even once cloud is off, so this is a hint rather than a reading of your" -ForegroundColor DarkGray
+        Write-Host "   actual setting.)" -ForegroundColor DarkGray
+    } else {
+        Write-Host "  (Steam leaves its marker file behind either way, so this tool cannot tell" -ForegroundColor DarkGray
+        Write-Host "   whether you have already turned it off.)" -ForegroundColor DarkGray
+    }
 }
 
 function Test-IsCloudSyncedPath {

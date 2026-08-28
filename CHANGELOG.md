@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.2
+
+- **The Steam Cloud warning now checks whether you have already dealt with it.** Steam keeps
+  its marker file's timestamp current while it is syncing, so the tool compares that against
+  your newest save: if you have played since Steam last touched the marker, Steam probably
+  is not syncing this game any more and the warning quietens down to a one-line note.
+- Comparing against save activity rather than the clock is deliberate — looking for a merely
+  "old" file would tell anyone who had not played for a week that cloud was off when it was not.
+- The guess is biased toward nagging. It never says "you're fine" on weak evidence, because
+  a false all-clear sends the user straight into the bug the warning exists for. It errs
+  cautious right after you change the setting, and on a fresh install with no save history.
+
 ## 1.1.1
 
 - **Setup now warns about Steam Cloud, and says how to turn it off.** Steam can overwrite a

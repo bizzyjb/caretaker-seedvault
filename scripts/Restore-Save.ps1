@@ -201,9 +201,10 @@ if ($targetSlot -like 'AutoSave*') {
 }
 # The moment this actually bites is right here, so mention it here rather than only
 # in a README the user reads after a restore has already reverted on them.
-if (Test-SteamCloudSaves -SourcePaths @($SavePath)) {
+$cloudHint = Get-SteamCloudHint -SourcePaths @($SavePath)
+if ($cloudHint.Present) {
     Write-Host ''
-    Show-SteamCloudAdvice -Short
+    Show-SteamCloudAdvice -Short -Hint $cloudHint
 }
 Write-Host ''
 if (-not $Yes) {
