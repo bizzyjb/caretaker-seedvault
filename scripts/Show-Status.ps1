@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Caretaker SeedVault - health check.
 
@@ -58,9 +58,21 @@ if ($running) {
 
 Write-Host ''
 Write-Host "  Vault    : $($cfg.ArchivePath)"
-foreach ($s in @($cfg.SourcePaths)) {
+foreach ($s in (Get-ExpandedSourcePaths -SourcePaths @($cfg.SourcePaths))) {
     $mark = if (Test-Path -LiteralPath $s) { ' ' } else { '!' }
     Write-Host "  Watching${mark}: $s"
+}
+
+# A game update can move the saves into a new profile folder. Say so plainly - the
+# alternative is a status screen that looks perfectly healthy while the folder it names
+# has not changed in weeks.
+$configured = @($cfg.SourcePaths)[0]
+$active     = Get-ActiveSavePath -SourcePaths @($cfg.SourcePaths)
+if ($active -and $configured -and $active -ne $configured) {
+    Write-Host ''
+    Write-Host "  The game is now saving into a different folder than setup chose:" -ForegroundColor Yellow
+    Write-Host "    $active" -ForegroundColor Yellow
+    Write-Host "  It is being watched as well, so nothing is being missed." -ForegroundColor DarkGray
 }
 
 if (Test-Path -LiteralPath $cfg.ArchivePath) {
@@ -175,6 +187,39 @@ if ($SelfTest) {
         $kept = @(Get-ChildItem (Join-Path $dst '_before-restore') -Recurse -File -ErrorAction SilentlyContinue)
         Check 'the save being replaced was kept first' ($kept.Count -ge 1 -and (Get-FileHash $kept[0].FullName -Algorithm SHA256).Hash -eq $liveBefore)
         Check 'restoring destroyed nothing in the vault' ((Test-Path $older.FullName) -and (Get-FileHash $older.FullName -Algorithm SHA256).Hash -eq $olderHash)
+
+        # ---- the game renaming its own saves must not break a restore ----
+        # A save archived as TestProfile_0.sav has to come back as NewProfile_0.sav once
+        # the game has started calling its saves NewProfile_*. Put back under the old name
+        # it would sit in exactly the right folder and the game would still show an empty
+        # slot.
+        $src4 = Join-Path $tmp 'src4'
+        $dst4 = Join-Path $tmp 'dst4'
+        New-Item -ItemType Directory -Path $src4, $dst4 -Force | Out-Null
+        $old4 = Join-Path $src4 'TestProfile_0.sav'
+        [System.IO.File]::WriteAllBytes($old4, (New-Object byte[] 700))
+        & $watcher -SourcePaths @($src4) -ArchivePath $dst4 -Once -Quiet | Out-Null
+        Remove-Item -LiteralPath $old4 -Force
+        $new4 = Join-Path $src4 'NewProfile_0.sav'
+        [System.IO.File]::WriteAllBytes($new4, (New-Object byte[] 300))
+        & $restorer -VaultPath $dst4 -SavePath $src4 -Index 1 -Yes 6>$null | Out-Null
+        Check 'a restore follows the name the game uses now' ((Test-Path $new4) -and (Get-Item $new4).Length -eq 700)
+        Check 'the name the game abandoned is not resurrected' (-not (Test-Path $old4))
+
+        # ---- a save folder appearing beside the watched one is picked up ----
+        # The Linux update of 31 August 2026 in miniature: the game stops writing to the
+        # profile folder setup chose and starts writing to a sibling. Watching only what
+        # the config names would quietly capture nothing from then on.
+        $root5 = Join-Path $tmp 'Voyage\Saved\SaveGames'
+        $old5  = Join-Path $root5 '76561197960000000'
+        $new5  = Join-Path $root5 'LocalSteamUser'
+        $dst5  = Join-Path $tmp 'dst5'
+        New-Item -ItemType Directory -Path $old5, $new5, $dst5 -Force | Out-Null
+        [System.IO.File]::WriteAllBytes((Join-Path $old5 '76561197960000000_0.sav'), (New-Object byte[] 400))
+        [System.IO.File]::WriteAllBytes((Join-Path $new5 'VoyageSaveGame_0.sav'),    (New-Object byte[] 500))
+        & $watcher -SourcePaths @($old5) -ArchivePath $dst5 -Once -Quiet | Out-Null
+        $stored5 = @(Get-ChildItem $dst5 -Recurse -Filter *.sav -File)
+        Check 'a save folder that appears beside the watched one is picked up' ($stored5.Count -eq 2)
 
         Write-Host ''
         if ($fail -eq 0) {

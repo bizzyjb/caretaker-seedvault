@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Caretaker SeedVault - the save monitor.
 
@@ -253,10 +253,26 @@ function Save-VaultCopy {
 
 # ------------------------------------------------------------------- poll ----
 
+<#
+    What each pass actually walks: the configured folders plus any sibling profile folder
+    that has turned up since. Refreshed as the monitor runs, so a folder the game starts
+    using mid-session is picked up without anyone having to re-run setup, or even notice.
+#>
+$script:WatchPaths = @()
+
+function Update-WatchPaths {
+    param([switch]$Announce)
+    foreach ($p in @(Get-ExpandedSourcePaths -SourcePaths $SourcePaths -Pattern $FilePattern)) {
+        if ($script:WatchPaths -contains $p) { continue }
+        $script:WatchPaths += $p
+        if ($Announce) { Write-Log "The game is saving somewhere new - watching that too: $p" 'WARN' }
+    }
+}
+
 function Invoke-Pass {
     $live = @{}
 
-    foreach ($dir in $SourcePaths) {
+    foreach ($dir in $script:WatchPaths) {
         if (-not (Test-Path -LiteralPath $dir)) { continue }
         $files = @(Get-ChildItem -LiteralPath $dir -Filter $FilePattern -File -ErrorAction SilentlyContinue)
 
@@ -353,8 +369,9 @@ if (-not $mutex.WaitOne(0)) {
 
 try {
     Initialize-Vault
+    Update-WatchPaths
     Write-Log "=== Caretaker SeedVault v$script:AppVersion started (every ${PollSeconds}s) ==="
-    foreach ($s in $SourcePaths) {
+    foreach ($s in $script:WatchPaths) {
         $state = if (Test-Path -LiteralPath $s) { 'watching' } else { 'not found yet' }
         Write-Log "  $state : $s"
     }
@@ -372,6 +389,9 @@ try {
             try {
                 Invoke-Pass
                 $tick++
+                # Roughly every five minutes at the default poll interval. Cheap, and it
+                # is what keeps a mid-session rename from costing somebody an evening.
+                if (($tick % 75)  -eq 0) { Update-WatchPaths -Announce }
                 if (($tick % 150) -eq 0) { Test-VaultSpace }
                 if (($tick % 900) -eq 0) { Invoke-Prune }
             } catch {

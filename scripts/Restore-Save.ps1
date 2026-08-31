@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Caretaker SeedVault - put an old save back into the game.
 
@@ -33,29 +33,11 @@ if (-not $VaultPath) {
 }
 if (-not $SavePath) {
     if (-not $cfg) { throw "Not set up yet. Run Setup.cmd first." }
-    # The first watched folder is the live save folder; the rest are the game's backups.
-    $SavePath = @($cfg.SourcePaths)[0]
-}
-
-function Get-SlotName {
-    param([string]$FileName)
-    # Our naming:            <slot>__2026-08-27_08-30-57[_2].sav
-    if ($FileName -match '^(.*?)__\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(_\d+)?\.[^.]+$') { return $Matches[1] }
-    # The game's own naming: <slot>_2026-08-27_08_16_21[_2].sav
-    if ($FileName -match '^(.*?)_\d{4}-\d{2}-\d{2}_\d{2}_\d{2}_\d{2}(_\d+)?\.[^.]+$')  { return $Matches[1] }
-    return [System.IO.Path]::GetFileNameWithoutExtension($FileName)
-}
-
-<#
-    Split "76561197961167679_AutoSave_0" into its profile id and its slot designator.
-    Autosave has to be checked first, or the trailing digit of "AutoSave_0" would be
-    mistaken for the slot number.
-#>
-function Split-SlotName {
-    param([string]$SlotName)
-    if ($SlotName -match '^(.*)_(AutoSave_\d+)$') { return @{ Profile = $Matches[1]; Designator = $Matches[2] } }
-    if ($SlotName -match '^(.*)_(\d+)$')          { return @{ Profile = $Matches[1]; Designator = $Matches[2] } }
-    return @{ Profile = $SlotName; Designator = '' }
+    # Where the game is saving *now*, which is not necessarily the folder chosen at setup:
+    # the game can rename it out from under us. Falls back to the configured folder when
+    # nothing has been written anywhere yet.
+    $SavePath = Get-ActiveSavePath -SourcePaths @($cfg.SourcePaths)
+    if (-not $SavePath) { $SavePath = @($cfg.SourcePaths)[0] }
 }
 
 # Accept "2", "slot 2", "auto", "autosave" and so on.
@@ -173,13 +155,26 @@ if ($PSBoundParameters.ContainsKey('ToSlot') -and $ToSlot) {
     }
 }
 
-$target = Join-Path $SavePath ("$($parts.Profile)_$targetSlot" + $chosen.Extension)
+# The game renames its own save files across updates - on Linux, 31 August 2026 turned
+# <SteamID>_0.sav into VoyageSaveGame_0.sav. A save archived under the old name has to go
+# back under the name in use now, or it lands in exactly the right folder and the game
+# still shows an empty slot.
+$targetProfile = $parts.Profile
+$livePrefix    = Get-LiveSavePrefix -SavePath $SavePath
+if ($livePrefix) { $targetProfile = $livePrefix }
+
+$target = Join-Path $SavePath ("${targetProfile}_$targetSlot" + $chosen.Extension)
 
 Write-Host ''
 Write-Host "   Restoring : $($chosen.Name)" -ForegroundColor Green
 Write-Host "   From      : $($chosen.LastWriteTime)" -ForegroundColor Green
 Write-Host "   Into slot : $targetSlot$(if ($targetSlot -ne $fromSlot) { "   (originally slot $fromSlot)" })" -ForegroundColor Yellow
 Write-Host "   File      : $target" -ForegroundColor DarkGray
+if ($targetProfile -ne $parts.Profile) {
+    Write-Host "   Renamed   : $($parts.Profile)_$targetSlot -> ${targetProfile}_$targetSlot" -ForegroundColor Cyan
+    Write-Host "               (the game changed how it names saves; this is the name it" -ForegroundColor DarkGray
+    Write-Host "                looks for now)" -ForegroundColor DarkGray
+}
 if (Test-Path -LiteralPath $target) {
     $cur = Get-Item -LiteralPath $target
     Write-Host "   Replacing : $(Format-Size $cur.Length) from $($cur.LastWriteTime)" -ForegroundColor Yellow

@@ -1,11 +1,11 @@
-<#
+﻿<#
     Caretaker SeedVault - shared helpers.
     Dot-sourced by the other scripts; not meant to be run directly.
 #>
 
 $script:AppName    = 'Caretaker SeedVault'
 $script:AppSlug    = 'CaretakerSeedVault'
-$script:AppVersion = '1.2.0'
+$script:AppVersion = '1.2.1'
 $script:TaskName   = 'CaretakerSeedVault'
 
 # Culture-invariant formatting. On a machine with a different locale, culture-aware
@@ -199,6 +199,120 @@ function Resolve-ManualSavePath {
         SaveCount   = $saves.Count
         TotalBytes  = ($saves | Measure-Object Length -Sum).Sum
     }
+}
+
+<#
+    Splitting a save file name into the part that names the profile and the part that
+    names the slot. Both live here rather than in Restore-Save.ps1 because working out
+    what the game currently calls its saves needs them too.
+#>
+function Get-SlotName {
+    param([string]$FileName)
+    # Our naming:            <slot>__2026-08-27_08-30-57[_2].sav
+    if ($FileName -match '^(.*?)__\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(_\d+)?\.[^.]+$') { return $Matches[1] }
+    # The game's own naming: <slot>_2026-08-27_08_16_21[_2].sav
+    if ($FileName -match '^(.*?)_\d{4}-\d{2}-\d{2}_\d{2}_\d{2}_\d{2}(_\d+)?\.[^.]+$')  { return $Matches[1] }
+    return [System.IO.Path]::GetFileNameWithoutExtension($FileName)
+}
+
+<#
+    Split "76561197961167679_AutoSave_0" into its profile id and its slot designator.
+    Autosave has to be checked first, or the trailing digit of "AutoSave_0" would be
+    mistaken for the slot number.
+#>
+function Split-SlotName {
+    param([string]$SlotName)
+    if ($SlotName -match '^(.*)_(AutoSave_\d+)$') { return @{ Profile = $Matches[1]; Designator = $Matches[2] } }
+    if ($SlotName -match '^(.*)_(\d+)$')          { return @{ Profile = $Matches[1]; Designator = $Matches[2] } }
+    return @{ Profile = $SlotName; Designator = '' }
+}
+
+<#
+    The game does not necessarily keep writing to the profile folder it used on the day
+    you set this up. Its update of 31 August 2026 moved the saves on Linux from
+    SaveGames\<SteamID>\<SteamID>_0.sav to SaveGames\LocalSteamUser\VoyageSaveGame_0.sav,
+    and left the old folder behind, still holding the old saves. Nothing errors and
+    nothing goes missing, so a monitor pinned to the folder named in its config carries on
+    watching a folder the game has stopped writing to - silence being the worst way for a
+    backup tool to fail.
+
+    Windows still uses the Steam ID form. Doing this here anyway costs one directory
+    listing per poll and means the same change arriving on Windows is a non-event: every
+    sibling profile folder under the same SaveGames / SaveGameBackups parent is watched
+    too, so both names are covered whichever way round a rename goes.
+#>
+function Test-DirHasSaves {
+    param([string]$Path, [string]$Pattern = '*.sav')
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $false }
+    return @(Get-ChildItem -LiteralPath $Path -Filter $Pattern -File -ErrorAction SilentlyContinue).Count -gt 0
+}
+
+# The full watch list: the configured folders first, then any sibling profile folder that
+# holds saves. No duplicates.
+function Get-ExpandedSourcePaths {
+    param([string[]]$SourcePaths, [string]$Pattern = '*.sav')
+
+    $out  = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($s in @($SourcePaths)) {
+        if ($s -and $seen.Add($s)) { $out.Add($s) }
+    }
+    foreach ($s in @($SourcePaths)) {
+        if (-not $s) { continue }
+        $parent = Split-Path $s -Parent
+        if (-not $parent) { continue }
+        # A folder typed in by hand from somewhere else has no siblings worth guessing at;
+        # only the game's own layout is predictable.
+        if ((Split-Path $parent -Leaf) -notin @('SaveGames', 'SaveGameBackups')) { continue }
+        foreach ($d in @(Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue)) {
+            if (-not (Test-DirHasSaves $d.FullName $Pattern)) { continue }
+            if ($seen.Add($d.FullName)) { $out.Add($d.FullName) }
+        }
+    }
+    return @($out)
+}
+
+<#
+    Of the folders being watched, the one the game is saving into now. The game's own
+    backup ring is skipped - restoring into it would achieve nothing. Newest save wins,
+    which is the rule detection already uses to rank profiles by "last played".
+#>
+function Get-ActiveSavePath {
+    param([string[]]$SourcePaths)
+
+    $best = $null
+    $bestTime = [datetime]::MinValue
+    foreach ($p in (Get-ExpandedSourcePaths -SourcePaths $SourcePaths)) {
+        if ((Split-Path (Split-Path $p -Parent) -Leaf) -eq 'SaveGameBackups') { continue }
+        $newest = Get-ChildItem -LiteralPath $p -Filter '*.sav' -File -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($newest -and $newest.LastWriteTime -gt $bestTime) {
+            $bestTime = $newest.LastWriteTime
+            $best     = $p
+        }
+    }
+    return $best
+}
+
+<#
+    The name the game currently gives its own saves in a folder - everything before the
+    slot designator. Read off the newest save actually sitting in the folder, because the
+    folder is the only thing that knows the answer for certain.
+#>
+function Get-LiveSavePrefix {
+    param([string]$SavePath)
+
+    if (-not $SavePath -or -not (Test-Path -LiteralPath $SavePath)) { return $null }
+    $newest = Get-ChildItem -LiteralPath $SavePath -Filter '*.sav' -File -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $newest) { return $null }
+
+    $parts = Split-SlotName (Get-SlotName $newest.Name)
+    # No slot designator means this is not one of the game's slot files, so its name says
+    # nothing about the naming scheme in use.
+    if (-not $parts.Designator) { return $null }
+    return $parts.Profile
 }
 
 # ----------------------------------------------------------------- utility ----
