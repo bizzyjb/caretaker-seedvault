@@ -88,6 +88,13 @@ inside the compatibility prefix:
     AppData/Local/Voyage/Saved/SaveGames/<your-steam-id>/
 ```
 
+The game update of **31 August 2026** changed that last folder on Linux. Saves now go to
+`SaveGames/LocalSteamUser/`, and the files inside are named `VoyageSaveGame_0.sav` rather
+than `<your-steam-id>_0.sav`. Nothing needs doing about it: the monitor watches both
+folders, notices within about five minutes if the game starts using a new one, and a
+restore of a save from before the change is written back under the name the game looks
+for now. Your old saves are still in the old folder, untouched, and still in the vault.
+
 On **Flatpak Steam** the same path sits under
 `~/.var/app/com.valvesoftware.Steam/.local/share/Steam/…` instead, and if you installed
 the game to a second drive or a Deck SD card it will be under that library's folder.

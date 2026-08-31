@@ -18,7 +18,7 @@ shopt -s nullglob
 
 APP_NAME='Caretaker SeedVault'
 APP_SLUG='caretaker-seedvault'
-APP_VERSION='1.2.0'
+APP_VERSION='1.2.1'
 SERVICE_NAME="${APP_SLUG}.service"
 
 # Culture-invariant everything: a machine with a different locale can otherwise rewrite
@@ -344,8 +344,16 @@ voyage_saved_dirs_deep() {
         sed 's#/SaveGames$##' | awk 'NF && !seen[$0]++'
 }
 
-# Emit one TAB-separated record per profile found, newest first:
-#   profile <TAB> savepath <TAB> backuppath <TAB> count <TAB> bytes <TAB> newest_mtime
+# Emit one record per profile found, newest first:
+#   profile <SEP> savepath <SEP> backuppath <SEP> count <SEP> bytes <SEP> newest_mtime
+#
+# The separator is a unit separator rather than a tab because the backup path is empty
+# for a profile the game has never written a backup for - and a tab is IFS whitespace,
+# so `read` collapses the run of two and every field after the gap slides along by one.
+# That put the save count where the folder path should be and wrote 'SourcePath=1' into
+# the config. A unit separator is not IFS whitespace, so empty fields survive intact,
+# and unlike a tab it cannot occur in a path.
+REC_SEP=$'\x1f'
 find_caretaker_saves() {
     local deep=${1:-false}
     local -a saved_dirs=()
@@ -372,17 +380,93 @@ find_caretaker_saves() {
             [ "$count" -eq 0 ] && continue
             bak="$saved/SaveGameBackups/$profile"
             [ -d "$bak" ] || bak=''
-            records+=("$newest	$profile	$profile_dir	$bak	$count	$bytes")
+            records+=("$newest$REC_SEP$profile$REC_SEP$profile_dir$REC_SEP$bak$REC_SEP$count$REC_SEP$bytes")
         done
     done
     [ ${#records[@]} -eq 0 ] && return 1
-    printf '%s\n' "${records[@]}" | sort -rn -k1,1 | awk -F'\t' 'BEGIN{OFS=FS} {print $2,$3,$4,$5,$6,$1}'
+    printf '%s\n' "${records[@]}" | sort -rn -t"$REC_SEP" -k1,1 |
+        awk -F"$REC_SEP" 'BEGIN{OFS=FS} {print $2,$3,$4,$5,$6,$1}'
+}
+
+# The game does not necessarily keep writing to the profile folder it used on the day
+# you set this up. The 2026-08-31 update moved saves on Linux from
+#
+#   SaveGames/<SteamID>/<SteamID>_0.sav  ->  SaveGames/LocalSteamUser/VoyageSaveGame_0.sav
+#
+# and the old folder is left behind, still full of the old saves. Nothing errors and
+# nothing goes missing, so the monitor carries on watching a folder the game has stopped
+# writing to - which is the worst way for a backup tool to fail: silently.
+#
+# So the config is a starting point, not the whole truth. Every sibling profile folder
+# under the same SaveGames / SaveGameBackups parent is watched too. Both names are
+# covered whichever way round the rename went, the next rename is covered in advance,
+# and a folder that never changes costs one directory listing per poll.
+dir_has_saves() {
+    local f
+    for f in "$1"/${CFG_FILE_PATTERN:-*.sav}; do
+        [ -f "$f" ] && return 0
+    done
+    return 1
+}
+
+# The full watch list - configured folders first, then any sibling profile folder that
+# holds saves. One per line, no duplicates. Fails if there is nothing at all.
+expanded_source_paths() {
+    local -a out=()
+    local s parent leaf d
+    for s in ${CFG_SOURCE_PATHS[@]+"${CFG_SOURCE_PATHS[@]}"}; do
+        [ -n "$s" ] && out+=("$s")
+    done
+    for s in ${CFG_SOURCE_PATHS[@]+"${CFG_SOURCE_PATHS[@]}"}; do
+        [ -n "$s" ] || continue
+        parent=$(dirname -- "$s")
+        leaf=$(basename -- "$parent")
+        case "$leaf" in
+            SaveGames|SaveGameBackups) ;;
+            # A folder typed in by hand from somewhere else has no siblings worth
+            # guessing at - only the game's own layout is predictable.
+            *) continue ;;
+        esac
+        for d in "$parent"/*/; do
+            d=${d%/}
+            [ -d "$d" ] || continue
+            dir_has_saves "$d" || continue
+            out+=("$d")
+        done
+    done
+    [ ${#out[@]} -gt 0 ] || return 1
+    printf '%s\n' "${out[@]}" | awk 'NF && !seen[$0]++'
+}
+
+# Of the folders being watched, the one the game is saving into now. The game's own
+# backup ring is skipped - restoring into it would achieve nothing. Newest save wins,
+# which is the rule detection already uses to rank profiles by "last played".
+active_save_dir() {
+    local d best='' best_t=-1 f mt
+    while IFS= read -r d; do
+        [ -n "$d" ] && [ -d "$d" ] || continue
+        case "$(basename -- "$(dirname -- "$d")")" in
+            SaveGameBackups) continue ;;
+        esac
+        for f in "$d"/*.sav; do
+            [ -f "$f" ] || continue
+            mt=$(stat_mtime "$f") || continue
+            [ -n "$mt" ] || continue
+            if [ "$mt" -gt "$best_t" ]; then best_t=$mt; best=$d; fi
+        done
+    done < <(expanded_source_paths)
+    [ -n "$best" ] || return 1
+    printf '%s' "$best"
 }
 
 # Validate a folder the user typed in, and opportunistically pair it with a sibling
 # SaveGameBackups folder, so manual entry gets the same coverage as auto-detection.
-# Sets RESOLVED_SOURCES; prints:  savepath <TAB> count <TAB> bytes
+# The answer comes back in RESOLVED_PATH and RESOLVED_SOURCES rather than on stdout,
+# and that matters: called as $(...) this whole function runs in a subshell, the globals
+# it sets die with it, and setup ends up watching nothing at all. It also asks a question
+# when the folder holds no saves, which a subshell would swallow.
 RESOLVED_SOURCES=()
+RESOLVED_PATH=''
 resolve_manual_save_path() {
     local p; p=$(clean_path "$1")
     [ -n "$p" ] || return 1
@@ -412,7 +496,7 @@ resolve_manual_save_path() {
             good "  Also found the game's own backup folder - it will be watched too."
         fi
     fi
-    printf '%s\t%s\t%s\n' "$p" "$count" "$bytes"
+    RESOLVED_PATH=$p
     return 0
 }
 
@@ -896,11 +980,30 @@ store_copy() {
 
 # ------------------------------------------------------------------- poll ----
 
+# What the poll actually walks: the configured folders plus any sibling profile folder
+# that has shown up since. Refreshed as the monitor runs, so a folder the game starts
+# using mid-session is picked up without anyone having to re-run setup or even notice.
+WATCH_PATHS=()
+declare -A WATCH_KNOWN=()
+
+refresh_watch_paths() {
+    local announce=${1:-false}
+    local d
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        [ -n "${WATCH_KNOWN[$d]:-}" ] && continue
+        WATCH_KNOWN["$d"]=1
+        WATCH_PATHS+=("$d")
+        [ "$announce" = true ] && log WARN "The game is saving somewhere new - watching that too: $d"
+    done < <(expanded_source_paths)
+    return 0
+}
+
 poll_once() {
     local -A live=()
     local dir f key sig sz mt
 
-    for dir in "${CFG_SOURCE_PATHS[@]}"; do
+    for dir in ${WATCH_PATHS[@]+"${WATCH_PATHS[@]}"}; do
         [ -d "$dir" ] || continue
         for f in "$dir"/$CFG_FILE_PATTERN; do
             [ -f "$f" ] || continue
@@ -1031,9 +1134,10 @@ cmd_watch() {
     trap watcher_shutdown TERM INT HUP
 
     init_vault
+    refresh_watch_paths
     log INFO "=== $APP_NAME v$APP_VERSION started (every ${CFG_POLL_SECONDS}s) ==="
     local s state
-    for s in "${CFG_SOURCE_PATHS[@]}"; do
+    for s in ${WATCH_PATHS[@]+"${WATCH_PATHS[@]}"}; do
         if [ -d "$s" ]; then state=watching; else state='not found yet'; fi
         log INFO "  $state : $s"
     done
@@ -1055,6 +1159,9 @@ cmd_watch() {
         # The loop must never die and leave saves unprotected.
         poll_once || log ERROR "Poll error (continuing)."
         tick=$((tick + 1))
+        # Roughly every five minutes at the default poll interval. Cheap, and it is what
+        # keeps a mid-session rename from costing somebody a night's progress.
+        [ $((tick % 75)) -eq 0 ] && refresh_watch_paths true
         [ $((tick % 150)) -eq 0 ] && check_space
         [ $((tick % 900)) -eq 0 ] && run_prune
         interruptible_sleep "$CFG_POLL_SECONDS"
@@ -1139,6 +1246,27 @@ split_slot_name() {
     SPLIT_PROFILE=$s; SPLIT_DESIGNATOR=''
 }
 
+# The name the game currently gives its own saves in a folder - everything before the
+# slot designator. That was the Steam ID before the 2026-08-31 update and is
+# "VoyageSaveGame" after it. Read off the newest save actually sitting in the folder,
+# because the folder is the only thing that knows the answer for certain.
+live_save_prefix() {
+    local dir=$1 f newest='' newest_t=-1 mt
+    [ -d "$dir" ] || return 1
+    for f in "$dir"/*.sav; do
+        [ -f "$f" ] || continue
+        mt=$(stat_mtime "$f") || continue
+        [ -n "$mt" ] || continue
+        if [ "$mt" -gt "$newest_t" ]; then newest_t=$mt; newest=$f; fi
+    done
+    [ -n "$newest" ] || return 1
+    split_slot_name "$(slot_name_of "$(basename -- "$newest")")"
+    # No slot designator means this is not one of the game's slot files, so its name
+    # says nothing about the naming scheme in use.
+    [ -n "$SPLIT_PROFILE" ] && [ -n "$SPLIT_DESIGNATOR" ] || return 1
+    printf '%s' "$SPLIT_PROFILE"
+}
+
 # Accept "2", "slot 2", "auto", "autosave", "auto_1" and so on.
 resolve_slot_designator() {
     local t=$1
@@ -1197,8 +1325,10 @@ cmd_restore() {
     if [ -z "$vault_path" ] || [ -z "$save_path" ]; then
         read_config || die "Not set up on this machine yet. Run:  $APP_SLUG setup"
         [ -n "$vault_path" ] || vault_path=$CFG_ARCHIVE_PATH
-        # The first watched folder is the live save folder; the rest are game backups.
-        [ -n "$save_path" ] || save_path=${CFG_SOURCE_PATHS[0]:-}
+        # Where the game is saving *now*, which is not necessarily the folder chosen at
+        # setup - the game can rename it out from under us. Falls back to the configured
+        # folder when nothing has been written anywhere yet.
+        [ -n "$save_path" ] || save_path=$(active_save_dir) || save_path=${CFG_SOURCE_PATHS[0]:-}
     fi
     [ -n "$save_path" ] || die "Do not know where your live saves are. Run:  $APP_SLUG setup"
 
@@ -1295,7 +1425,13 @@ cmd_restore() {
         fi
     fi
 
-    local target="$save_path/${profile}_${target_slot}${chosen_ext}"
+    # The game renames its own save files across updates - 2026-08-31 turned
+    # <SteamID>_0.sav into VoyageSaveGame_0.sav. A save archived under the old name has
+    # to go back under the name in use now, or it lands in exactly the right folder and
+    # the game still shows an empty slot.
+    local target_profile=$profile live_prefix
+    live_prefix=$(live_save_prefix "$save_path") && [ -n "$live_prefix" ] && target_profile=$live_prefix
+    local target="$save_path/${target_profile}_${target_slot}${chosen_ext}"
 
     printf '\n'
     good "   Restoring : $chosen_name"
@@ -1306,6 +1442,11 @@ cmd_restore() {
         warn "   Into slot : $target_slot"
     fi
     dim  "   File      : $target"
+    if [ "$target_profile" != "$profile" ]; then
+        info "   Renamed   : ${profile}_${target_slot} -> ${target_profile}_${target_slot}"
+        dim  "               (the game changed how it names saves; this is the name it"
+        dim  "                looks for now)"
+    fi
     if [ -e "$target" ]; then
         warn "   Replacing : $(fmt_size "$(stat_size "$target")") from $(fmt_mtime "$target")"
         dim  "               (this will be kept in the vault, not lost)"
@@ -1425,10 +1566,24 @@ cmd_status() {
         printf '\n'
         say "  Vault    : $CFG_ARCHIVE_PATH"
         local s mark
-        for s in "${CFG_SOURCE_PATHS[@]}"; do
+        local -a watched=()
+        while IFS= read -r s; do [ -n "$s" ] && watched+=("$s"); done < <(expanded_source_paths)
+        for s in ${watched[@]+"${watched[@]}"}; do
             if [ -d "$s" ]; then mark=' '; else mark='!'; fi
             say "  Watching$mark: $s"
         done
+
+        # A game update can move the saves into a new profile folder. Say so plainly -
+        # the alternative is a status screen that looks perfectly healthy while the
+        # folder it names has not changed in weeks.
+        local configured=${CFG_SOURCE_PATHS[0]:-} active
+        active=$(active_save_dir) || active=''
+        if [ -n "$active" ] && [ -n "$configured" ] && [ "$active" != "$configured" ]; then
+            printf '\n'
+            warn "  The game is now saving into a different folder than setup chose:"
+            warn "    $active"
+            dim  "  It is being watched as well, so nothing is being missed."
+        fi
 
         if [ -d "$CFG_ARCHIVE_PATH" ]; then
             local count=0 bytes=0 newest_t=0 oldest_t=0 newest_p='' oldest_p='' mt sz pth
@@ -1617,6 +1772,55 @@ run_self_test() {
     st_check 'an existing vault file is never overwritten' st_same_hash "$decoy" "$decoy_hash"
     st_check 'the save is stored alongside it instead' [ "$(stat_size "$dst3/$day3/TestProfile_9__${stamp3}_2.sav" 2>/dev/null)" = 1024 ]
 
+    # ---- the game renaming its own saves must not break a restore ----
+    # A save archived as TestProfile_0.sav has to come back as NewProfile_0.sav once the
+    # game has started calling its saves NewProfile_*. Put back under the old name it
+    # would sit in exactly the right folder and the game would still show an empty slot.
+    local src4="$tmp/src4" dst4="$tmp/dst4"
+    mkdir -p "$src4" "$dst4"
+    head -c 700 /dev/zero > "$src4/TestProfile_0.sav"
+    "$SELF" watch --once --quiet --vault "$dst4" --source "$src4" >/dev/null 2>&1
+    rm -f -- "$src4/TestProfile_0.sav"
+    head -c 300 /dev/zero > "$src4/NewProfile_0.sav"
+    "$SELF" restore --vault "$dst4" --save-path "$src4" --index 1 --yes >/dev/null 2>&1
+    st_check 'a restore follows the name the game uses now' \
+        [ "$(stat_size "$src4/NewProfile_0.sav" 2>/dev/null)" = 700 ]
+    st_check 'the name the game abandoned is not resurrected' [ ! -e "$src4/TestProfile_0.sav" ]
+
+    # ---- a save folder appearing beside the watched one is picked up ----
+    # This is the 2026-08-31 update in miniature: the game stops writing to the profile
+    # folder setup chose and starts writing to a sibling. Watching only what the config
+    # names would quietly capture nothing from then on.
+    local root5="$tmp/Voyage/Saved/SaveGames" dst5="$tmp/dst5"
+    local old5="$root5/76561197960000000" new5="$root5/LocalSteamUser"
+    mkdir -p "$old5" "$new5" "$dst5"
+    head -c 400 /dev/zero > "$old5/76561197960000000_0.sav"
+    head -c 500 /dev/zero > "$new5/VoyageSaveGame_0.sav"
+    "$SELF" watch --once --quiet --vault "$dst5" --source "$old5" >/dev/null 2>&1
+    st_check 'a save folder that appears beside the watched one is picked up' \
+        [ "$(st_count_saves "$dst5")" = 2 ]
+
+    # ---- a folder given by hand is really watched ----
+    # Called in a subshell this reports success while handing back nothing, and setup
+    # writes a config with no folders in it at all.
+    local src6="$tmp/Voyage/Saved/SaveGames/TestProfile"
+    mkdir -p "$src6"
+    head -c 128 /dev/zero > "$src6/TestProfile_0.sav"
+    RESOLVED_SOURCES=(); RESOLVED_PATH=''
+    resolve_manual_save_path "$src6" >/dev/null 2>&1
+    st_check 'a folder given by hand is the one that gets watched' [ "${RESOLVED_PATH:-}" = "$src6" ]
+    st_check 'and it reaches the watch list' [ "${#RESOLVED_SOURCES[@]}" -ge 1 ]
+
+    # ---- a profile with no backup folder must not shift the other fields ----
+    # Its record has an empty column in the middle. Split on something `read` treats as
+    # whitespace and the gap closes up, every later field slides along one, and setup
+    # offers you a save count where the folder name should be.
+    local rec7 pr7 sv7 bk7 ct7 by7 nw7
+    rec7="1700000000${REC_SEP}LocalSteamUser${REC_SEP}/tmp/x${REC_SEP}${REC_SEP}3${REC_SEP}99"
+    IFS=$REC_SEP read -r nw7 pr7 sv7 bk7 ct7 by7 <<<"$rec7"
+    st_check 'a profile with no backup folder still reads back correctly' \
+        [ "$nw7|$pr7|$sv7|$bk7|$ct7|$by7" = "1700000000|LocalSteamUser|/tmp/x||3|99" ]
+
     rm -rf -- "$tmp" 2>/dev/null
 
     printf '\n'
@@ -1791,13 +1995,13 @@ cmd_setup() {
     local chosen_save='' chosen_backup=''
 
     if [ -n "$save_path" ]; then
-        local line; line=$(resolve_manual_save_path "$save_path") || die "The save path given is not usable: $save_path"
-        chosen_save=$(printf '%s' "$line" | cut -f1)
+        resolve_manual_save_path "$save_path" || die "The save path given is not usable: $save_path"
+        chosen_save=$RESOLVED_PATH
         sources=("${RESOLVED_SOURCES[@]}")
     else
         local -a cand_profile=() cand_save=() cand_bak=() cand_count=() cand_bytes=() cand_newest=()
         local pr sv bk ct by nw
-        while IFS=$'\t' read -r pr sv bk ct by nw; do
+        while IFS=$REC_SEP read -r pr sv bk ct by nw; do
             [ -n "$sv" ] || continue
             cand_profile+=("$pr"); cand_save+=("$sv"); cand_bak+=("$bk")
             cand_count+=("$ct");   cand_bytes+=("$by"); cand_newest+=("$nw")
@@ -1811,7 +2015,7 @@ cmd_setup() {
                 [Nn]*) ;;
                 *)
                     dim "  Searching..."
-                    while IFS=$'\t' read -r pr sv bk ct by nw; do
+                    while IFS=$REC_SEP read -r pr sv bk ct by nw; do
                         [ -n "$sv" ] || continue
                         cand_profile+=("$pr"); cand_save+=("$sv"); cand_bak+=("$bk")
                         cand_count+=("$ct");   cand_bytes+=("$by"); cand_newest+=("$nw")
@@ -1870,20 +2074,37 @@ cmd_setup() {
             dim "  (Blank to cancel.)"
             local manual; read -r -p "  Path: " manual
             [ -n "${manual:-}" ] || { say "  Setup cancelled."; return 0; }
-            local line
-            if line=$(resolve_manual_save_path "$manual"); then
-                chosen_save=$(printf '%s' "$line" | cut -f1)
+            if resolve_manual_save_path "$manual"; then
+                chosen_save=$RESOLVED_PATH
                 sources=("${RESOLVED_SOURCES[@]}")
             fi
         done
     fi
 
+    # Sibling profile folders are watched anyway, so fold them in here too: it makes the
+    # setup screen honest, and it means the first snapshot below covers them.
+    local prof_parent sib
+    prof_parent=$(dirname -- "$chosen_save")
+    if [ -n "$chosen_save" ] && [ "$(basename -- "$prof_parent")" = SaveGames ]; then
+        for sib in "$prof_parent"/*/; do
+            sib=${sib%/}
+            [ -d "$sib" ] && [ "$sib" != "$chosen_save" ] || continue
+            dir_has_saves "$sib" || continue
+            sources+=("$sib")
+        done
+    fi
+
     printf '\n'
     good "  Watching: $chosen_save"
-    local s
+    local s extra_profiles=0
     for s in "${sources[@]}"; do
         [ "$s" != "$chosen_save" ] && good "           + $s"
+        [ "$s" != "$chosen_save" ] && [ "$s" != "$chosen_backup" ] && extra_profiles=$((extra_profiles + 1))
     done
+    if [ "$extra_profiles" -gt 0 ]; then
+        dim "  (More than one profile folder has saves in it. All of them are watched, so"
+        dim "   a game update that renames the folder cannot slip past unnoticed.)"
+    fi
 
     # ------------------------------------------------- 2. where the vault ----
     printf '\n'
