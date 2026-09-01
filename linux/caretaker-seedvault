@@ -438,24 +438,69 @@ expanded_source_paths() {
     printf '%s\n' "${out[@]}" | awk 'NF && !seen[$0]++'
 }
 
-# Of the folders being watched, the one the game is saving into now. The game's own
-# backup ring is skipped - restoring into it would achieve nothing. Newest save wins,
-# which is the rule detection already uses to rank profiles by "last played".
+# When was the newest save in this folder written? Fails if there are none.
+newest_save_time_in() {
+    local dir=$1 f mt newest=-1
+    [ -d "$dir" ] || return 1
+    for f in "$dir"/*.sav; do
+        [ -f "$f" ] || continue
+        mt=$(stat_mtime "$f") || continue
+        [ -n "$mt" ] || continue
+        [ "$mt" -gt "$newest" ] && newest=$mt
+    done
+    [ "$newest" -ge 0 ] || return 1
+    printf '%s' "$newest"
+}
+
+# A folder name that is nothing but digits is a Steam ID, and a Steam ID means a person.
+is_steam_id_name() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *)           return 0 ;;
+    esac
+}
+
+# Which folder a restore should be written into. Not quite the same question as "where is
+# the newest save", and the difference matters.
+#
+# The folder chosen at setup wins by default. Two Steam accounts on one machine means two
+# profile folders side by side, and following whichever was played last would drop a
+# restored save into the other person's game. Watching both is harmless - a spare copy
+# costs disk and nothing else - but writing into the wrong one is not.
+#
+# It gives way only when it has plainly been left behind: it is gone, or it has no saves
+# at all, or another folder holds newer saves *and* the two names are not both Steam IDs.
+# Two all-digit names are two accounts. Digits giving way to a name is the game changing
+# its own scheme, which is what happened on 2026-08-31 - and nothing here knows or cares
+# what that name is, so a different one next time is handled the same way.
+#
+# The game's own backup ring is never a candidate; restoring into it would achieve
+# nothing. With no configured folder given, this is just "newest save wins".
 active_save_dir() {
-    local d best='' best_t=-1 f mt
+    local configured=${1:-}
+    local d t best='' best_t=-1 conf_t=-1
+
     while IFS= read -r d; do
         [ -n "$d" ] && [ -d "$d" ] || continue
         case "$(basename -- "$(dirname -- "$d")")" in
             SaveGameBackups) continue ;;
         esac
-        for f in "$d"/*.sav; do
-            [ -f "$f" ] || continue
-            mt=$(stat_mtime "$f") || continue
-            [ -n "$mt" ] || continue
-            if [ "$mt" -gt "$best_t" ]; then best_t=$mt; best=$d; fi
-        done
+        t=$(newest_save_time_in "$d") || continue
+        [ "$d" = "$configured" ] && conf_t=$t
+        if [ "$t" -gt "$best_t" ]; then best_t=$t; best=$d; fi
     done < <(expanded_source_paths)
+
     [ -n "$best" ] || return 1
+    [ "$best" = "$configured" ] && { printf '%s' "$best"; return 0; }
+
+    # The configured folder still holds saves, and the busier one is just another
+    # account rather than the game renaming things. Stay where we were put.
+    if [ "$conf_t" -ge 0 ] &&
+       is_steam_id_name "$(basename -- "$configured")" &&
+       is_steam_id_name "$(basename -- "$best")"; then
+        printf '%s' "$configured"
+        return 0
+    fi
     printf '%s' "$best"
 }
 
@@ -1306,7 +1351,7 @@ show_current_slots() {
 
 cmd_restore() {
     local slot_filter='' last=30 index=0 to_slot='' assume_yes=false
-    local vault_path='' save_path='' to_slot_given=false
+    local vault_path='' save_path='' configured_dir='' to_slot_given=false
     while [ $# -gt 0 ]; do
         case "$1" in
             --slot)      shift; slot_filter=${1:-} ;;
@@ -1326,9 +1371,11 @@ cmd_restore() {
         read_config || die "Not set up on this machine yet. Run:  $APP_SLUG setup"
         [ -n "$vault_path" ] || vault_path=$CFG_ARCHIVE_PATH
         # Where the game is saving *now*, which is not necessarily the folder chosen at
-        # setup - the game can rename it out from under us. Falls back to the configured
-        # folder when nothing has been written anywhere yet.
-        [ -n "$save_path" ] || save_path=$(active_save_dir) || save_path=${CFG_SOURCE_PATHS[0]:-}
+        # setup - the game can rename it out from under us. Sticks with the configured
+        # folder unless that one has plainly been abandoned; falls back to it outright
+        # when nothing has been written anywhere yet.
+        configured_dir=${CFG_SOURCE_PATHS[0]:-}
+        [ -n "$save_path" ] || save_path=$(active_save_dir "$configured_dir") || save_path=$configured_dir
     fi
     [ -n "$save_path" ] || die "Do not know where your live saves are. Run:  $APP_SLUG setup"
 
@@ -1442,6 +1489,10 @@ cmd_restore() {
         warn "   Into slot : $target_slot"
     fi
     dim  "   File      : $target"
+    if [ -n "$configured_dir" ] && [ "$save_path" != "$configured_dir" ]; then
+        info "   Folder    : not the one setup chose - the game's saves are newest here."
+        dim  "               setup chose: $configured_dir"
+    fi
     if [ "$target_profile" != "$profile" ]; then
         info "   Renamed   : ${profile}_${target_slot} -> ${target_profile}_${target_slot}"
         dim  "               (the game changed how it names saves; this is the name it"
@@ -1577,7 +1628,7 @@ cmd_status() {
         # the alternative is a status screen that looks perfectly healthy while the
         # folder it names has not changed in weeks.
         local configured=${CFG_SOURCE_PATHS[0]:-} active
-        active=$(active_save_dir) || active=''
+        active=$(active_save_dir "$configured") || active=''
         if [ -n "$active" ] && [ -n "$configured" ] && [ "$active" != "$configured" ]; then
             printf '\n'
             warn "  The game is now saving into a different folder than setup chose:"
@@ -1820,6 +1871,42 @@ run_self_test() {
     IFS=$REC_SEP read -r nw7 pr7 sv7 bk7 ct7 by7 <<<"$rec7"
     st_check 'a profile with no backup folder still reads back correctly' \
         [ "$nw7|$pr7|$sv7|$bk7|$ct7|$by7" = "1700000000|LocalSteamUser|/tmp/x||3|99" ]
+
+    # ---- two Steam accounts must not be mistaken for a rename ----
+    # Both folders get watched, which only costs disk. But a restore has to stay in the
+    # folder that was set up, or it lands in the other person's game.
+    local sg8="$tmp/two/Voyage/Saved/SaveGames"
+    local mine="$sg8/76561197960000001" theirs="$sg8/76561197960000002"
+    mkdir -p "$mine" "$theirs"
+    head -c 128 /dev/zero > "$mine/76561197960000001_0.sav"
+    head -c 128 /dev/zero > "$theirs/76561197960000002_0.sav"
+    touch -d '2020-01-01 00:00' "$mine/76561197960000001_0.sav" 2>/dev/null
+    CFG_SOURCE_PATHS=("$mine")
+    st_check 'a second Steam account does not steal the restore' \
+        [ "$(active_save_dir "$mine")" = "$mine" ]
+    st_check 'but both accounts are still watched' \
+        [ "$(expanded_source_paths | wc -l)" = 2 ]
+
+    # ---- a renamed folder still wins, whatever it is called ----
+    # Nothing here knows the name the game picked - only that it is not another Steam ID.
+    local sg9="$tmp/renamed/Voyage/Saved/SaveGames"
+    local was="$sg9/76561197960000001" now="$sg9/SomeFutureName"
+    mkdir -p "$was" "$now"
+    head -c 128 /dev/zero > "$was/76561197960000001_0.sav"
+    head -c 128 /dev/zero > "$now/SomeFutureName_0.sav"
+    touch -d '2020-01-01 00:00' "$was/76561197960000001_0.sav" 2>/dev/null
+    CFG_SOURCE_PATHS=("$was")
+    st_check 'a folder under a new name does take over' [ "$(active_save_dir "$was")" = "$now" ]
+
+    # ---- and an empty configured folder gives way to whatever has saves ----
+    local sg10="$tmp/emptied/Voyage/Saved/SaveGames"
+    local gone="$sg10/76561197960000001" live="$sg10/76561197960000002"
+    mkdir -p "$gone" "$live"
+    head -c 128 /dev/zero > "$live/76561197960000002_0.sav"
+    CFG_SOURCE_PATHS=("$gone")
+    st_check 'an emptied folder gives way even to another Steam ID' \
+        [ "$(active_save_dir "$gone")" = "$live" ]
+    CFG_SOURCE_PATHS=()
 
     rm -rf -- "$tmp" 2>/dev/null
 

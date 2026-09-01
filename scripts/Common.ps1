@@ -273,24 +273,58 @@ function Get-ExpandedSourcePaths {
     return @($out)
 }
 
+# A folder name that is nothing but digits is a Steam ID, and a Steam ID means a person.
+function Test-SteamIdName {
+    param([string]$Name)
+    return ($Name -match '^\d+$')
+}
+
 <#
-    Of the folders being watched, the one the game is saving into now. The game's own
-    backup ring is skipped - restoring into it would achieve nothing. Newest save wins,
-    which is the rule detection already uses to rank profiles by "last played".
+    Which folder a restore should be written into. Not quite the same question as "where
+    is the newest save", and the difference matters.
+
+    The folder chosen at setup wins by default. Two Steam accounts on one machine means
+    two profile folders side by side, and following whichever was played last would drop
+    a restored save into the other person's game. Watching both is harmless - a spare
+    copy costs disk and nothing else - but writing into the wrong one is not.
+
+    It gives way only when it has plainly been left behind: it is gone, or it holds no
+    saves at all, or another folder holds newer saves *and* the two names are not both
+    Steam IDs. Two all-digit names are two accounts. Digits giving way to a name is the
+    game changing its own scheme - and nothing here knows or cares what that name is, so
+    a different one next time is handled the same way.
+
+    The game's own backup ring is never a candidate; restoring into it would achieve
+    nothing. With no configured folder given, this is just "newest save wins".
 #>
 function Get-ActiveSavePath {
-    param([string[]]$SourcePaths)
+    param([string[]]$SourcePaths, [string]$Configured)
 
-    $best = $null
+    $best     = $null
     $bestTime = [datetime]::MinValue
+    $confTime = $null
+
     foreach ($p in (Get-ExpandedSourcePaths -SourcePaths $SourcePaths)) {
         if ((Split-Path (Split-Path $p -Parent) -Leaf) -eq 'SaveGameBackups') { continue }
         $newest = Get-ChildItem -LiteralPath $p -Filter '*.sav' -File -ErrorAction SilentlyContinue |
                   Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if ($newest -and $newest.LastWriteTime -gt $bestTime) {
+        if (-not $newest) { continue }
+        if ($Configured -and $p -eq $Configured) { $confTime = $newest.LastWriteTime }
+        if ($newest.LastWriteTime -gt $bestTime) {
             $bestTime = $newest.LastWriteTime
             $best     = $p
         }
+    }
+
+    if (-not $best) { return $null }
+    if ($best -eq $Configured) { return $best }
+
+    # The configured folder still holds saves, and the busier one is just another account
+    # rather than the game renaming things. Stay where we were put.
+    if ($null -ne $confTime -and
+        (Test-SteamIdName (Split-Path $Configured -Leaf)) -and
+        (Test-SteamIdName (Split-Path $best -Leaf))) {
+        return $Configured
     }
     return $best
 }

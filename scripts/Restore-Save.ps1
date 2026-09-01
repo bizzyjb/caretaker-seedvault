@@ -31,13 +31,16 @@ if (-not $VaultPath) {
     if (-not $cfg) { throw "Not set up yet. Run Setup.cmd first." }
     $VaultPath = $cfg.ArchivePath
 }
+$configuredSavePath = $null
 if (-not $SavePath) {
     if (-not $cfg) { throw "Not set up yet. Run Setup.cmd first." }
     # Where the game is saving *now*, which is not necessarily the folder chosen at setup:
-    # the game can rename it out from under us. Falls back to the configured folder when
-    # nothing has been written anywhere yet.
-    $SavePath = Get-ActiveSavePath -SourcePaths @($cfg.SourcePaths)
-    if (-not $SavePath) { $SavePath = @($cfg.SourcePaths)[0] }
+    # the game can rename it out from under us. Sticks with the configured folder unless
+    # that one has plainly been abandoned; falls back to it outright when nothing has been
+    # written anywhere yet.
+    $configuredSavePath = @($cfg.SourcePaths)[0]
+    $SavePath = Get-ActiveSavePath -SourcePaths @($cfg.SourcePaths) -Configured $configuredSavePath
+    if (-not $SavePath) { $SavePath = $configuredSavePath }
 }
 
 # Accept "2", "slot 2", "auto", "autosave" and so on.
@@ -170,6 +173,10 @@ Write-Host "   Restoring : $($chosen.Name)" -ForegroundColor Green
 Write-Host "   From      : $($chosen.LastWriteTime)" -ForegroundColor Green
 Write-Host "   Into slot : $targetSlot$(if ($targetSlot -ne $fromSlot) { "   (originally slot $fromSlot)" })" -ForegroundColor Yellow
 Write-Host "   File      : $target" -ForegroundColor DarkGray
+if ($configuredSavePath -and $SavePath -ne $configuredSavePath) {
+    Write-Host "   Folder    : not the one setup chose - the game's saves are newest here." -ForegroundColor Cyan
+    Write-Host "               setup chose: $configuredSavePath" -ForegroundColor DarkGray
+}
 if ($targetProfile -ne $parts.Profile) {
     Write-Host "   Renamed   : $($parts.Profile)_$targetSlot -> ${targetProfile}_$targetSlot" -ForegroundColor Cyan
     Write-Host "               (the game changed how it names saves; this is the name it" -ForegroundColor DarkGray

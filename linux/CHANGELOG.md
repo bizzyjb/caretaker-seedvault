@@ -26,6 +26,20 @@ Three things in 1.2.0 handled that badly, all now fixed.
 - **`status` now says when the game has moved**, and lists every folder being watched
   rather than only the configured one.
 
+None of this is pinned to the new names. Nothing in the code mentions `LocalSteamUser` or
+`VoyageSaveGame` outside comments and test fixtures: folders are found by their position
+under `Voyage/Saved/SaveGames`, and the name to restore under is read off whatever the
+game has most recently written. A third naming scheme later needs no changes here.
+
+Watching is additive and restoring is conservative, which are deliberately different
+answers. Every profile folder found gets watched, because a spare copy costs only disk
+while a missed save is gone for good. A **restore** stays in the folder setup chose
+unless that folder has plainly been abandoned — it is gone, it holds no saves, or another
+folder holds newer ones under a name that is not just a different Steam ID. Two all-digit
+folder names are two people sharing a machine, not a rename, and a restore must not land
+in the other person's game. When a restore does use a different folder it says so, and
+`--save-path` still overrides everything.
+
 Two bugs found while fixing the above, both present in 1.2.0:
 
 - **Setting up with a path you typed in watched nothing at all.** The path was validated

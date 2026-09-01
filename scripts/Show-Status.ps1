@@ -67,7 +67,7 @@ foreach ($s in (Get-ExpandedSourcePaths -SourcePaths @($cfg.SourcePaths))) {
 # alternative is a status screen that looks perfectly healthy while the folder it names
 # has not changed in weeks.
 $configured = @($cfg.SourcePaths)[0]
-$active     = Get-ActiveSavePath -SourcePaths @($cfg.SourcePaths)
+$active     = Get-ActiveSavePath -SourcePaths @($cfg.SourcePaths) -Configured $configured
 if ($active -and $configured -and $active -ne $configured) {
     Write-Host ''
     Write-Host "  The game is now saving into a different folder than setup chose:" -ForegroundColor Yellow
@@ -220,6 +220,45 @@ if ($SelfTest) {
         & $watcher -SourcePaths @($old5) -ArchivePath $dst5 -Once -Quiet | Out-Null
         $stored5 = @(Get-ChildItem $dst5 -Recurse -Filter *.sav -File)
         Check 'a save folder that appears beside the watched one is picked up' ($stored5.Count -eq 2)
+
+        # ---- two Steam accounts must not be mistaken for a rename ----
+        # Both folders get watched, which only costs disk. But a restore has to stay in
+        # the folder that was set up, or it lands in the other person's game.
+        $sg8    = Join-Path $tmp 'two\Voyage\Saved\SaveGames'
+        $mine   = Join-Path $sg8 '76561197960000001'
+        $theirs = Join-Path $sg8 '76561197960000002'
+        New-Item -ItemType Directory -Path $mine, $theirs -Force | Out-Null
+        $mineSave = Join-Path $mine '76561197960000001_0.sav'
+        [System.IO.File]::WriteAllBytes($mineSave, (New-Object byte[] 128))
+        [System.IO.File]::WriteAllBytes((Join-Path $theirs '76561197960000002_0.sav'), (New-Object byte[] 128))
+        (Get-Item $mineSave).LastWriteTime = (Get-Date).AddDays(-30)
+        Check 'a second Steam account does not steal the restore' `
+            ((Get-ActiveSavePath -SourcePaths @($mine) -Configured $mine) -eq $mine)
+        Check 'but both accounts are still watched' `
+            ((Get-ExpandedSourcePaths -SourcePaths @($mine)).Count -eq 2)
+
+        # ---- a renamed folder still wins, whatever it is called ----
+        # Nothing here knows the name the game picked - only that it is not another
+        # Steam ID.
+        $sg9 = Join-Path $tmp 'renamed\Voyage\Saved\SaveGames'
+        $was = Join-Path $sg9 '76561197960000001'
+        $now = Join-Path $sg9 'SomeFutureName'
+        New-Item -ItemType Directory -Path $was, $now -Force | Out-Null
+        $wasSave = Join-Path $was '76561197960000001_0.sav'
+        [System.IO.File]::WriteAllBytes($wasSave, (New-Object byte[] 128))
+        [System.IO.File]::WriteAllBytes((Join-Path $now 'SomeFutureName_0.sav'), (New-Object byte[] 128))
+        (Get-Item $wasSave).LastWriteTime = (Get-Date).AddDays(-30)
+        Check 'a folder under a new name does take over' `
+            ((Get-ActiveSavePath -SourcePaths @($was) -Configured $was) -eq $now)
+
+        # ---- and an empty configured folder gives way to whatever has saves ----
+        $sg10 = Join-Path $tmp 'emptied\Voyage\Saved\SaveGames'
+        $gone = Join-Path $sg10 '76561197960000001'
+        $live = Join-Path $sg10 '76561197960000002'
+        New-Item -ItemType Directory -Path $gone, $live -Force | Out-Null
+        [System.IO.File]::WriteAllBytes((Join-Path $live '76561197960000002_0.sav'), (New-Object byte[] 128))
+        Check 'an emptied folder gives way even to another Steam ID' `
+            ((Get-ActiveSavePath -SourcePaths @($gone) -Configured $gone) -eq $live)
 
         Write-Host ''
         if ($fail -eq 0) {
