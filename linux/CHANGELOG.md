@@ -1,8 +1,58 @@
 # Changelog — Linux edition
 
-Both editions share one version number, so 1.2.0 here and 1.2.0 there are the same
+Both editions share one version number, so 1.2.1 here and 1.2.1 there are the same
 feature set on two platforms. See the top-level `CHANGELOG.md` for the history of the
 features themselves.
+
+## 1.2.1 — the game moved the saves
+
+The Last Caretaker update of 31 August 2026 changed where it saves on Linux, from
+`SaveGames/<SteamID>/<SteamID>_0.sav` to `SaveGames/LocalSteamUser/VoyageSaveGame_0.sav`.
+Three things in 1.2.0 handled that badly, all now fixed.
+
+- **The monitor followed the old folder into oblivion.** The folder chosen at setup was
+  the only one ever watched, and after the update it still existed and still held the old
+  saves — so nothing errored, nothing looked wrong, and nothing was being backed up. Every
+  profile folder alongside the watched one is now watched too, rechecked as the monitor
+  runs, so a folder the game invents mid-session is picked up within about five minutes
+  and logged when it happens. No need to re-run setup, and the next rename is covered in
+  advance.
+- **Restores used the old file name.** A save archived as `<SteamID>_3.sav` was written
+  back under that name, into a folder where the game only looks for `VoyageSaveGame_3.sav`
+  — it landed in exactly the right place and the slot still showed up empty. A restore now
+  takes its name from the saves that are actually in the folder, and says so when it
+  renames. It also restores into the folder the game is writing to now, not the one setup
+  happened to pick.
+- **`status` now says when the game has moved**, and lists every folder being watched
+  rather than only the configured one.
+
+None of this is pinned to the new names. Nothing in the code mentions `LocalSteamUser` or
+`VoyageSaveGame` outside comments and test fixtures: folders are found by their position
+under `Voyage/Saved/SaveGames`, and the name to restore under is read off whatever the
+game has most recently written. A third naming scheme later needs no changes here.
+
+Watching is additive and restoring is conservative, which are deliberately different
+answers. Every profile folder found gets watched, because a spare copy costs only disk
+while a missed save is gone for good. A **restore** stays in the folder setup chose
+unless that folder has plainly been abandoned — it is gone, it holds no saves, or another
+folder holds newer ones under a name that is not just a different Steam ID. Two all-digit
+folder names are two people sharing a machine, not a rename, and a restore must not land
+in the other person's game. When a restore does use a different folder it says so, and
+`--save-path` still overrides everything.
+
+Two bugs found while fixing the above, both present in 1.2.0:
+
+- **Setting up with a path you typed in watched nothing at all.** The path was validated
+  in a subshell, so the result never made it back out and the config was written with no
+  folders in it. This affected `--save-path` and the "paste a path" fallback — the exact
+  route anyone takes when auto-detection misses.
+- **A profile folder with no matching `SaveGameBackups` folder shifted setup's other
+  fields along by one**, showing a save count as the folder name and writing a nonsense
+  `SourcePath=1` into the config. Harmless before the update, because every profile had a
+  backup folder; the new `LocalSteamUser` folder does not, so it triggered on any fresh
+  install after the update.
+
+Three new self-test checks cover the rename, and two cover the bugs above — 22 in total.
 
 ## 1.2.0 — first Linux release
 

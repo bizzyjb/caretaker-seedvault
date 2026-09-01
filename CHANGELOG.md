@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.2.1
+
+- **Linux: the game moved its saves and the monitor did not follow.** The Last Caretaker
+  update of 31 August 2026 writes to `SaveGames/LocalSteamUser/VoyageSaveGame_*.sav`
+  instead of `SaveGames/<SteamID>/<SteamID>_*.sav`. The old folder is left behind intact,
+  so an installed monitor kept watching it and quietly captured nothing. It now watches
+  every profile folder beside the one it was given and rechecks while running, restores
+  under the name the game currently uses, and reports a move in `status`. Two further
+  Linux bugs found while fixing it — a hand-typed save path being dropped on the floor,
+  and a field shift when a profile has no backup folder — are fixed as well. See
+  `linux/CHANGELOG.md`.
+- **Nothing is pinned to the new folder or file names**, which only some players have so
+  far: they appear nowhere outside comments and tests. Save folders are still found by
+  position under `Voyage/Saved/SaveGames`, and the name to restore under is read off
+  whatever the game has most recently written. Watching is additive — every profile
+  folder found is watched, since a spare copy costs only disk. Restoring is conservative
+  — it stays in the folder setup chose unless that one has plainly been abandoned, so two
+  Steam accounts on one machine cannot send a restored save into the wrong person's
+  game.
+- Windows is unaffected by the game's change: saves there are still
+  `SaveGames\<SteamID>\<SteamID>_*.sav`. The same two weaknesses existed in the
+  Windows edition though — a watch list frozen at setup, and a restore that rebuilt the
+  file name from the archived copy — so both are hardened there too, before the devs ever
+  make the same change on Windows.
+
 ## 1.2.0
 
 - **There is now a Linux edition**, in `linux/`, at feature parity with the Windows one.

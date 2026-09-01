@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Caretaker SeedVault - interactive setup.
 
@@ -94,10 +94,20 @@ if ($SavePath) {
     }
 }
 
+# Sibling profile folders are watched anyway, so fold them in here as well: it makes this
+# screen honest, and it means the first snapshot below covers them.
+$chosen.SourcePaths = @(Get-ExpandedSourcePaths -SourcePaths @($chosen.SourcePaths))
+
 Write-Host ''
 Write-Host "  Watching: $($chosen.SavePath)" -ForegroundColor Green
 foreach ($s in @($chosen.SourcePaths)) {
     if ($s -ne $chosen.SavePath) { Write-Host "           + $s" -ForegroundColor Green }
+}
+$otherProfiles = @($chosen.SourcePaths | Where-Object {
+    $_ -ne $chosen.SavePath -and (Split-Path (Split-Path $_ -Parent) -Leaf) -eq 'SaveGames' })
+if ($otherProfiles.Count -gt 0) {
+    Write-Host "  (More than one profile folder has saves in it. All of them are watched, so" -ForegroundColor DarkGray
+    Write-Host "   a game update that renames the folder cannot slip past unnoticed.)" -ForegroundColor DarkGray
 }
 
 # ----------------------------------------------------- 2. where the vault ----
