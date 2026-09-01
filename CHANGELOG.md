@@ -24,6 +24,13 @@
   Windows edition though — a watch list frozen at setup, and a restore that rebuilt the
   file name from the archived copy — so both are hardened there too, before the devs ever
   make the same change on Windows.
+- **One of those hardening changes fixes something already reachable on Windows.** If you
+  have ever switched Steam accounts, your vault holds saves under the old account's ID,
+  and restoring one wrote it back under that name — into the right folder, beside the
+  live save, under a name the game never reads. The restore reported success and the slot
+  was unchanged in game. It now goes back under the name the game is reading. A second
+  Steam account's profile folder is also watched now, which costs a little vault space.
+  With one Steam account and one profile folder, 1.2.0 and 1.2.1 behave identically.
 
 ## 1.2.0
 
